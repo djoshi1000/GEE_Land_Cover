@@ -1,0 +1,197 @@
+// ============================================================
+// FILTER ALL 16 CLASSES TO FORT BEND
+// PRINT SAME GEE IMPORT FORMAT WITH COLORS
+// SAFE VERSION
+// ============================================================
+
+
+// 1) Fort Bend County boundary
+
+var fortBend = ee.FeatureCollection("TIGER/2018/Counties")
+  .filter(ee.Filter.eq("STATEFP", "48"))
+  .filter(ee.Filter.eq("NAME", "Fort Bend"));
+
+Map.centerObject(fortBend, 9);
+Map.addLayer(fortBend, {color: "red"}, "Fort Bend County");
+
+
+// 2) Class info: name, color, collection
+
+var classInfo = [
+  {
+    name: "Water_11",
+    color: "#5475a8",
+    collection: Water_11
+  },
+  {
+    name: "Develop_NoStructure_20",
+    color: "#fff4d9",
+    collection: Develop_NoStructure_20
+  },
+  {
+    name: "Develop_Open_21",
+    color: "#d63000",
+    collection: Develop_Open_21
+  },
+  {
+    name: "Develop_Low_22",
+    color: "#ff9999",
+    collection: Develop_Low_22
+  },
+  {
+    name: "Develop_Medium_23",
+    color: "#ff0000",
+    collection: Develop_Medium_23
+  },
+  {
+    name: "Develop_High_24",
+    color: "#a80000",
+    collection: Develop_High_24
+  },
+  {
+    name: "Barren_Land_31",
+    color: "#b3ac9f",
+    collection: Barren_Land_31
+  },
+  {
+    name: "Deciduous_Forest_41",
+    color: "#68ab5f",
+    collection: Deciduous_Forest_41
+  },
+  {
+    name: "Evergreen_Forest_42",
+    color: "#1c5f2c",
+    collection: Evergreen_Forest_42
+  },
+  {
+    name: "Mixed_Forest_43",
+    color: "#b5c58f",
+    collection: Mixed_Forest_43
+  },
+  {
+    name: "Shrub_52",
+    color: "#ccb879",
+    collection: Shrub_52
+  },
+  {
+    name: "Grassland_71",
+    color: "#dfdfc2",
+    collection: Grassland_71
+  },
+  {
+    name: "Pasture_81",
+    color: "#dcd939",
+    collection: Pasture_81
+  },
+  {
+    name: "Cultivated_82",
+    color: "#ab6c28",
+    collection: Cultivated_82
+  },
+  {
+    name: "Woody_Wetland_90",
+    color: "#b8d9eb",
+    collection: Woody_Wetland_90
+  },
+  {
+    name: "Herbaceous_95",
+    color: "#6c9fb8",
+    collection: Herbaceous_95
+  }
+];
+
+
+// 3) Function to convert one filtered class into text
+
+function makeImportText(info, classIndex, totalClasses, list) {
+
+  // If GEE gives undefined, treat it safely as empty.
+  list = list || [];
+
+  var lines = [];
+
+  if (classIndex === 0) {
+    lines.push("var " + info.name + " = /* color: " + info.color + " */ee.FeatureCollection(");
+  } else {
+    lines.push("    " + info.name + " = /* color: " + info.color + " */ee.FeatureCollection(");
+  }
+
+  lines.push("        [");
+
+  list.forEach(function(feature, i) {
+    var coords = feature.geometry.coordinates;
+    var props = feature.properties || {};
+    var comma = i < list.length - 1 ? "," : "";
+
+    lines.push("        ee.Feature(");
+    lines.push("            ee.Geometry.Point([" + coords[0] + ", " + coords[1] + "]),");
+    lines.push("            {");
+    lines.push('              "Class": ' + JSON.stringify(props.Class) + ",");
+    lines.push('              "system:index": ' + JSON.stringify(String(i)));
+    lines.push("            })" + comma);
+  });
+
+  if (classIndex < totalClasses - 1) {
+    lines.push("        ]),");
+  } else {
+    lines.push("        ]);");
+  }
+
+  return lines.join("\n");
+}
+
+
+// 4) Filter and print all classes
+
+var outputParts = [];
+var finished = 0;
+
+classInfo.forEach(function(info, classIndex) {
+
+  var filtered = info.collection.filterBounds(fortBend.geometry());
+
+  Map.addLayer(filtered, {color: info.color}, info.name);
+
+  print(info.name + " count inside Fort Bend:", filtered.size());
+
+  filtered.size().evaluate(function(count) {
+
+    // If class has 0 points inside Fort Bend, still print empty collection.
+    if (count === 0) {
+      outputParts[classIndex] = makeImportText(
+        info,
+        classIndex,
+        classInfo.length,
+        []
+      );
+
+      finished++;
+
+      if (finished === classInfo.length) {
+        print("COPY THIS FULL FILTERED IMPORT BLOCK:", outputParts.join("\n"));
+      }
+
+    } else {
+
+      filtered.toList(count).evaluate(function(list) {
+
+        outputParts[classIndex] = makeImportText(
+          info,
+          classIndex,
+          classInfo.length,
+          list
+        );
+
+        finished++;
+
+        if (finished === classInfo.length) {
+          print("COPY THIS FULL FILTERED IMPORT BLOCK:", outputParts.join("\n"));
+        }
+
+      });
+
+    }
+
+  });
+
+});

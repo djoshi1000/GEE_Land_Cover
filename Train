@@ -1,0 +1,2759 @@
+ 
+
+/*
+// ======================================================================= 
+//
+//            ~ ~ ~ FAST SENTINEL-2 RF PIPELINE (16C) ~ ~ ~
+//
+//   * CLEAN/OPTIMIZED
+//   * Merged training ASSET option (no memory overflow)
+//   * Robust tuner + Full vs "drop 4 least-important bands"
+//   * Seasonal mosaics: spring / summer / fall / combos
+//
+//    Code: Durga Joshi (Nov 23 2025)
+//    Edited: March 04 2026 
+
+//  External Import of Samples:
+.....
+
+USGS NLCD Classes (Non-Alaskan):
+
+    Open Water (Code: 11)
+    Perennial Ice/Snow (Code: 12)
+    Developed, Open Space (Code: 21)
+    Developed, Low Intensity (Code: 22)
+    Developed, Medium Intensity (Code: 23)
+    Developed, High Intensity (Code: 24)
+    Barren Land (Rock/Sand/Clay) (Code: 31)
+    Deciduous Forest (Code: 41)
+    Evergreen Forest (Code: 42)
+    Mixed Forest (Code: 43)
+    Shrub/Scrub (Code: 52)
+    Grassland/Herbaceous (Code: 71)
+    Pasture/Hay (Code: 81)
+    Cultivated Crops (Code: 82)
+    Woody Wetlands (Code: 90)
+
+// =======================================================================
+
+
+
+*/
+
+// ==================================================================================
+//                              USER VARIABLES
+// ==================================================================================
+// var project_name = "Colorado, Matagorda, & Wharton";   // No Spaces Please
+var targetYear   = 2025;
+var minPointsRequired = 1;
+var external_samples_path = '';  
+var layerSummerRGB     = null;
+
+// ==================================================================================
+//                              USER SWITCHES
+// ==================================================================================
+// DO NOT CHANGE THESE HERE, USE ON TOGGLE SWITCHES
+var CREATE_NEW_CLASSES = false;
+var sampleCheckBool = false;
+var USE_MERGED_ASSET = false;   
+var SHOW_MOSAICS_ONLY  = false;
+var EXPORT_ALL_IMAGES = false;
+var EXPORT_CLASSIFIED = false;
+var TUNE_MODEL = false; 
+// ==================================================================================
+// FINAL OUTPUT SETTINGS (mis-points + export use this raster)
+// ==================================================================================
+var APPLY_SMOOTHING = false;        // true = final raster uses focal_mode smoothing
+var SMOOTHING_RADIUS_PIX = 1;      // 1 pixel = 3x3 mode filter
+
+// --- PRIMARY CLASSIFICATION RUN SETTINGS ---
+var MAX_CLOUD_PERCENT = 10;
+var SAMPLE_SCALE = 10;  
+
+// Defines the time window for the primary mosaic generation.
+var MOSAIC_MODE_PRIMARY = 'All';
+
+
+// ==================================================================================
+//                              RANDOM FOREST CONSTANTS
+// ==================================================================================
+var CLASS_COUNT = 16;
+var CLASS_ORDER = ee.List.sequence(1, CLASS_COUNT);
+var randomSeed = 42;
+
+var initialnumberOfTrees = 250;
+var numberOfTrees = initialnumberOfTrees;
+
+var initialminLeafPopulation = 1;
+var minLeafPopulation = initialminLeafPopulation;
+
+var initialvariablesPerSplit = 6;
+var variablesPerSplit = initialvariablesPerSplit;
+
+var initialbagFraction = 0.63;
+var bagFraction = initialbagFraction;
+
+
+// ==================================================================================
+//                     MODEL EXPORT / REUSE SETTINGS
+// ==================================================================================
+var EXPORT_FINAL_MODEL = false;          // export trained RF model as EE asset
+var EXPORT_MODEL_METADATA = false;       // optional: save bands/params as CSV
+var GEE_PROJECT_ID = 'Sem_west';   // <-- change this
+var project_name= GEE_PROJECT_ID;
+var MODEL_VERSION = 'v1';
+
+// Freeze the exact band list used by the saved model.
+// IMPORTANT: training and inference must use this exact same list/order.
+var FINAL_MODEL_BANDS = [
+  'NDVI',
+  'B_MNDWI',       // Water index
+  //'B_BSI',         // Built-up / soil index
+  //'B_EVI2',        // Vegetation index
+  'B_NDRE',        // Red edge index
+  //'B_SAVI',        // Vegetation index
+  //'B_LSWI',        // Moisture / SWIR-based
+  //'B_NBR',         // Burn / vegetation index
+  'B_MOISTURE',    // Combined NDMI + NDMI_GLCM_var
+  //'B_BUILTUP',     // Combined NDBI + IBI
+  'B_SWIR_COMBO',   // Combined ClayMineralIndex + SWIR_Ratio
+  'B_COMBO_VEG',
+  'B_SLOPE',
+  'B_BAEI',
+  "B2", 
+  'B8', 
+  //'B11',
+  'B8_GLCM_var',
+  'B_TWI',
+  'B_VH_StdDev',
+  'B_VV_StdDev',
+  'B_RVI',
+  'B_PASTURE_PROB'
+];
+
+
+function safeAssetName(txt) {
+  return String(txt).replace(/[^A-Za-z0-9_]+/g, '_');
+}
+
+function buildModelAssetId() {
+  return 'projects/' + GEE_PROJECT_ID + '/assets/rf_models/' +
+         safeAssetName(project_name) + '_' +
+         String(targetYear) + '_' +
+         safeAssetName(MOSAIC_MODE_PRIMARY) + '_' +
+         MODEL_VERSION;
+}
+
+
+
+// ==================================================================================
+//                     EXPORT TRAINED CLASSIFIER + METADATA
+// ==================================================================================
+function exportSavedClassifier(bestClassifier, bestParams, modelBands) {
+  var modelAssetId = buildModelAssetId();
+  var exportDesc = 'RF_MODEL_' +
+    safeAssetName(project_name) + '_' +
+    String(targetYear) + '_' +
+    safeAssetName(MOSAIC_MODE_PRIMARY) + '_' +
+    MODEL_VERSION;
+
+  // 1) Export the trained classifier asset
+  Export.classifier.toAsset({
+    classifier: bestClassifier,
+    description: exportDesc,
+    assetId: modelAssetId
+  });
+
+  print('Classifier export task created.');
+  print('Saved model assetId:', modelAssetId);
+
+  // 2) Optional metadata export (very useful for reproducibility)
+  if (EXPORT_MODEL_METADATA) {
+    var metaFc = ee.FeatureCollection([
+      ee.Feature(null, {
+        model_asset_id: modelAssetId,
+        project_name: project_name,
+        target_year: targetYear,
+        mosaic_mode: MOSAIC_MODE_PRIMARY,
+        model_version: MODEL_VERSION,
+        band_list_json: JSON.stringify(modelBands),
+        rf_params_json: JSON.stringify(bestParams),
+        sample_scale: SAMPLE_SCALE,
+        cloud_percent: MAX_CLOUD_PERCENT,
+        smoothing_applied: APPLY_SMOOTHING,
+        smoothing_radius_pix: SMOOTHING_RADIUS_PIX
+      })
+    ]);
+
+    Export.table.toDrive({
+      collection: metaFc,
+      description: exportDesc + '_META',
+      folder: 'GEE_Random_Forest_' + safeAssetName(project_name),
+      fileNamePrefix: exportDesc + '_META',
+      fileFormat: 'CSV'
+    });
+
+    print('Model metadata export task created.');
+  }
+}
+
+
+// =======================================================================
+//                              USGS NLCD 
+// =======================================================================
+var year2023 = 2023;
+var nlcd_landcover = ee.ImageCollection("projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/LANDCOVER");
+
+// Define visualization parameters for each layer
+var vizParams = {
+  'landcover': {
+    min: 1,
+    max: 16,
+    palette: [
+      '#466b9f', '#d2d2d2', '#dec5c5', '#d99282', '#eb0000', '#ab0000',
+      '#b3ac9f', '#68ab5f', '#1c5f2c', '#b5c58f', '#dfdfc2','#000000', 
+      '#dcd939', '#ab6c28', '#b8d9eb', '#6c9fb8'
+    ]
+  },
+  'landcover_confidence': {min: 1, max: 100, palette: [
+    '#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026', 
+    '#7fca4f', '#66c255', '#4dba5b', '#33b160', '#19a766', '#009e6b', '#008763', '#00715a', '#005b52'
+  ]},
+  'fractional_impervious_surface': {min: 1, max: 100, palette: ['#d3d3d3', '#c9b1b1', '#b38484', '#e75454', '#ff7fbf', '#cc66cc', '#9933cc', '#660099']},
+  'impervious_descriptor': {min: 0, max: 2, palette: ['#000000', '#2171b5', '#f6ec27']},
+  'spectral_change_doy': {min: 1, max: 366, palette: ['#6a0dad', '#483d8b', '#1e90ff', '#00fa9a', '#32cd32', '#ffff00', '#ff8c00', '#ff4500', '#ff0000']}
+};
+
+
+
+// Original class values, continuous remapped values, color palette, and simplified class names
+var originalClasses = [11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95];
+var remappedClasses = ee.List.sequence(1, originalClasses.length);
+
+// Function to remap each image's land cover classes and keep the year property
+function remapImage(image) {
+  var remapped = image.remap(originalClasses, remappedClasses, null);
+  return remapped.copyProperties(image, ['year']).set('system:time_start', image.get('system:time_start'));
+}
+
+// Apply remapping to the entire collection
+var nlcd_landcover = nlcd_landcover.map(remapImage);
+var landcover_2023 = nlcd_landcover.filter(ee.Filter.eq('year', 2023));
+
+Map.addLayer(landcover_2023.first(), vizParams.landcover, 'USGS Landcover 2023', false);
+
+
+
+
+
+// =======================================================================
+//                              Add Legend  
+// =======================================================================
+var classPalette = [
+  '#0062a8','#d9cfcf','#e99d9d','#ff0000','#cc0000','#990000',
+  '#f1cf24','#85C77E','#38814E','#809f71','#dad41d','#68fd24',
+  '#FBF65D','#CA9146','#C8E6F8','#64B3D5'
+];
+
+var classLabels = [
+  '1  Water (NLCD 11)',
+  '2  Developed, Non-Structures (NLCD 20)',
+  '3  Developed, Open Space (NLCD 21)',
+  '4  Developed, Low Intensity (NLCD 22)',
+  '5  Developed, Medium Intensity (NLCD 23)',
+  '6  Developed, High Intensity (NLCD 24)',
+  '7  Barren Land (NLCD 31)',
+  '8  Deciduous Forest (NLCD 41)',
+  '9  Evergreen Forest (NLCD 42)',
+  '10 Mixed Forest (NLCD 43)',
+  '11 Shrub/Scrub (NLCD 52)',
+  '12 Grassland/Herbaceous (NLCD 71)',
+  '13 Pasture/Hay (NLCD 81)',
+  '14 Cultivated Crops (NLCD 82)',
+  '15 Woody Wetlands (NLCD 90)',
+  '16 Herbaceous Wetlands (NLCD 95)'
+];
+  
+  
+function addClassLegend(palette, labels, title, position) {
+    position = position || 'bottom-left';
+    title = title || 'Land Cover Legend (1–16)';
+  
+    var legend = ui.Panel({
+      style: {
+        position: position,
+        padding: '8px 12px',
+        backgroundColor: 'white',
+        border: '0px none #ccc'
+      }
+    });
+  
+    // Title
+    legend.add(ui.Label({
+      value: title,
+      style: {
+        fontWeight: 'bold',
+        fontSize: '14px',
+        margin: '0 0 6px 0',
+        border: '0px none #000000',
+      }
+    }));
+  
+    // Row creation function
+    function makeRow(color, name) {
+      return ui.Panel({
+        widgets: [
+          ui.Label('', {
+            backgroundColor: color,
+            padding: '8px',
+            margin: '0 6px 0 0',
+            border: '1px solid #000'
+          }),
+          ui.Label(name, {fontSize: '12px', margin: '0'})
+        ],
+        layout: ui.Panel.Layout.flow('horizontal')
+      });
+    }
+  
+    // Add each class row
+    labels.forEach(function(label, i) {
+      legend.add(makeRow(palette[i], label));
+    });
+  
+    return legend;
+  }
+  
+
+var legend = addClassLegend(classPalette, classLabels, "Classified 16C Legend");
+
+
+
+// ==================================================================================
+//                                  HGAC Counties
+// ====================================================================================
+var TIGER_COUNTIES_ASSET = 'TIGER/2018/Counties';
+var STATE_FIPS = '48'; 
+
+var AUSTIN_COUNTY_FIPS = '015'; 
+var BRAZORIA_COUNTY_FIPS = '039'; 
+var CHAMBERS_COUNTY_FIPS = '071'; 
+var COLORADO_COUNTY_FIPS = '089'; 
+var FORT_BEND_COUNTY_FIPS = '157'; 
+var GALVESTON_COUNTY_FIPS = '167'; 
+var HARRIS_COUNTY_FIPS = '201';
+var LIBERTY_COUNTY_FIPS = '291'; 
+var MATAGORDA_COUNTY_FIPS = '321'; 
+var MONTGOMERY_COUNTY_FIPS = '339'; 
+var WHARTON_COUNTY_FIPS = '481'; 
+var WALKER_COUNTY_FIPS = '471'; 
+var WALLER_COUNTY_FIPS = '473'; 
+
+ // Function to Create a HGAC Geometry
+ function generate_HGAC_counties() {
+  var counties = ee.FeatureCollection(TIGER_COUNTIES_ASSET);
+  
+  var texasFilter = ee.Filter.eq('STATEFP', STATE_FIPS);
+
+  var countyFipsFilter = ee.Filter.inList('COUNTYFP', 
+      [AUSTIN_COUNTY_FIPS, BRAZORIA_COUNTY_FIPS, CHAMBERS_COUNTY_FIPS,  COLORADO_COUNTY_FIPS,
+      FORT_BEND_COUNTY_FIPS, GALVESTON_COUNTY_FIPS, HARRIS_COUNTY_FIPS, LIBERTY_COUNTY_FIPS,
+      MATAGORDA_COUNTY_FIPS, MONTGOMERY_COUNTY_FIPS, WHARTON_COUNTY_FIPS, WALKER_COUNTY_FIPS, WALLER_COUNTY_FIPS ]
+  );
+
+  var combinedFilter = ee.Filter.and(texasFilter, countyFipsFilter);
+
+  var selectedCounties = counties.filter(combinedFilter);
+
+  var HGAC_Geometry = selectedCounties.geometry().dissolve({maxError: 1});
+  
+  return {
+    geometry: HGAC_Geometry,
+    features: selectedCounties
+  };
+}
+
+var addCountiesToMap = function(featureCollection, visParam, layerName) {
+  
+  var collection = ee.FeatureCollection(featureCollection);
+  var styleFeature = function(feature) {
+    return feature.set('style', visParam);
+  };
+  
+  var styleCollection = collection.map(styleFeature);
+  var count = collection.size();
+  
+  Map.addLayer(styleCollection.style({styleProperty: 'style'}), {}, layerName);
+};
+
+var hgacResult = generate_HGAC_counties();
+var HGAC_Geometry = hgacResult.geometry;
+var selectedCountiesFC = hgacResult.features;
+var countyVisParams = {
+    color: '000000',    
+    width: 2.0,          
+    fillColor: '00000000'
+};
+
+addCountiesToMap(selectedCountiesFC, countyVisParams, "HGAC Counties", false);
+
+
+
+
+
+
+// ==================================================================================
+//                             GLOBAL VARIABLES
+// ==================================================================================
+// Years _________________
+var YEAR_LIST = ee.List.sequence(2020, 2030);
+
+// Counties _________________
+// Counties _________________
+// Separate TRAIN vs INFER selections (client-side JS arrays)
+var TRAIN_SELECTED_COUNTIES = [];
+var INFER_SELECTED_COUNTIES = [];
+
+// helper: add/remove a 3-digit FIPS in a list
+function setFips(list, fips3, checked) {
+  var idx = list.indexOf(fips3);
+  if (checked && idx === -1) list.push(fips3);
+  if (!checked && idx !== -1) list.splice(idx, 1);
+}
+
+
+var COUNTY_FIPS_1 = {
+  'Austin County':       '015',
+  'Brazoria County':     '039',
+  'Chambers County':     '071',
+  'Colorado County':     '089',
+  'Fort Bend County':    '157',
+  'Galveston County':    '167',
+  'Harris County':       '201',
+};
+
+var COUNTY_FIPS_2 = {
+  'Liberty County':      '291',
+  'Matagorda County':    '321',
+  'Montgomery County':   '339',
+  'Walker County':       '471',
+  'Waller County':       '473',
+  'Wharton County':      '481'
+};
+
+// -------------------- TRAIN county checkboxes --------------------
+var trainCountyCheckboxes_1 = Object.keys(COUNTY_FIPS_1).map(function(countyName) {
+  return ui.Checkbox({
+    label: countyName,
+    value: false,
+    onChange: function(checked) {
+      setFips(TRAIN_SELECTED_COUNTIES, COUNTY_FIPS_1[countyName], checked);
+      //print('TRAIN_SELECTED_COUNTIES:', TRAIN_SELECTED_COUNTIES);
+    },
+    style: { fontSize: '10px', margin: '0px 0px 2px 0px' }
+  });
+});
+
+var trainCountyCheckboxes_2 = Object.keys(COUNTY_FIPS_2).map(function(countyName) {
+  return ui.Checkbox({
+    label: countyName,
+    value: false,
+    onChange: function(checked) {
+      setFips(TRAIN_SELECTED_COUNTIES, COUNTY_FIPS_2[countyName], checked);
+      //print('TRAIN_SELECTED_COUNTIES:', TRAIN_SELECTED_COUNTIES);
+    },
+    style: { fontSize: '10px', margin: '0px 0px 2px 0px' }
+  });
+});
+
+// -------------------- INFER county checkboxes --------------------
+var inferCountyCheckboxes_1 = Object.keys(COUNTY_FIPS_1).map(function(countyName) {
+  return ui.Checkbox({
+    label: countyName,
+    value: false,
+    onChange: function(checked) {
+      setFips(INFER_SELECTED_COUNTIES, COUNTY_FIPS_1[countyName], checked);
+      //print('INFER_SELECTED_COUNTIES:', INFER_SELECTED_COUNTIES);
+    },
+    style: { fontSize: '10px', margin: '0px 0px 2px 0px' }
+  });
+});
+
+var inferCountyCheckboxes_2 = Object.keys(COUNTY_FIPS_2).map(function(countyName) {
+  return ui.Checkbox({
+    label: countyName,
+    value: false,
+    onChange: function(checked) {
+      setFips(INFER_SELECTED_COUNTIES, COUNTY_FIPS_2[countyName], checked);
+      //print('INFER_SELECTED_COUNTIES:', INFER_SELECTED_COUNTIES);
+    },
+    style: { fontSize: '10px', margin: '0px 0px 2px 0px' }
+  });
+});
+
+
+function isEEListEmpty(eeList) {
+  return eeList.size().eq(0);
+}
+
+
+
+// Bands _________________
+var SELECTED_BANDS = [
+  'B2',
+  'B3',
+  'B4',
+  'B8',
+  'B11', // Added back as it is used in your Map view
+  // 'B5', // Calculated but usually excluded from final stacks unless needed for training
+  // 'B7',
+  'B12',
+  'B_NDRE',
+  'NDVI',
+  'B_MNDWI',
+  'B_BAEI',
+  'B_COMBO_VEG',
+  'B_SLOPE',
+  'B8_GLCM_var',
+  'B_MOISTURE',
+  'B_SWIR_COMBO',
+  'B_TWI',
+  'B_VH_StdDev',
+  'B_VV_StdDev',
+  'B_RVI',
+  'B_PASTURE_PROB',
+  'B_TCW'
+];
+  
+  
+
+var SELECTING_BANDS = {
+    // Core Bands
+    "B2": "B2 - Blue band",
+    "B3": "B3 - Green band",
+    "B4": "B4 - Red band",
+    "B8": "B8 - Near-Infrared (NIR) band",
+    "B11": "B11 - Shortwave-Infrared (SWIR) band 1",
+    "B12": "B12 - Shortwave-Infrared (SWIR) band 2",
+    
+    // Spectral Indices
+    "NDVI": "NDVI - Normalized Difference Vegetation Index",
+    "B_MNDWI": "B_MNDWI - Modified Normalized Difference Water Index",
+    "B_NDRE": "B_NDRE - Normalized Difference Red Edge",
+    "B_BAEI": "B_BAEI - Built Up Area Index",
+    "B_MOISTURE": "B_MOISTURE - Combined Moisture Index (NDMI + NDMI_GLCM_var)",
+    "B_SWIR_COMBO": "B_SWIR_COMBO - Combined SWIR Index (ClayMineralIndex + SWIR_Ratio)",
+    "B_TCW": "B_TCW - Tasseled Cap Wetness",
+    
+    // Vegetation & Pasture Logic
+    "B_COMBO_VEG": "B_COMBO_VEG - Veg Moisture Combo",
+    "B_PASTURE_PROB": "B_PASTURE_PROB - Pasture Probability",
+    
+    // Terrain
+    "B_SLOPE": "B_SLOPE - Slope RAD",
+    "B_TWI": "B_TWI - Topographic Wetness Index",
+    
+    // Radar (Sentinel-1)
+    "B_RVI": "B_RVI - Radar Vegetation Index",
+    "B_VV_StdDev": "B_VV_StdDev - Temporal standard deviation of VV",
+    "B_VH_StdDev": "B_VH_StdDev - Temporal standard deviation of VH",
+    
+    // Texture (GLCM)
+    "B8_GLCM_var": "B8_GLCM_var - NIR GLCM Variance"
+};
+
+// Bands Toggle
+function toggleBands(label, checked) {
+  var band = SELECTING_BANDS[label];
+
+  if (checked) {
+    // Add if not already added
+    if (SELECTED_BANDS.indexOf(band) === -1) {
+      SELECTED_BANDS.push(band);
+    }
+  } else {
+    // Remove if unchecked
+    SELECTED_BANDS = SELECTED_BANDS.filter(function(x) { return x !== band; });
+  }
+}
+
+var bandsCheckboxes = Object.keys(SELECTING_BANDS).map(function(bandName) {
+  return ui.Checkbox({
+    label: bandName,
+    value: true,
+    onChange: function(checked) {
+      toggleBands(bandName, checked);
+      //print(SELECTED_BANDS);
+    },
+    style: { fontSize: '10px', margin: '0px 0px 2px 0px' }
+  });
+});
+
+
+// ==================================================================================
+//                              SAMPLE REQUIREMENTS
+// ==================================================================================
+function normalizeGeom(g) {
+  var asFC = ee.FeatureCollection(g);
+  var isFC = asFC.size().gt(0);
+
+  return ee.Algorithms.If(
+    isFC,
+    asFC.union().geometry(),
+
+    ee.Algorithms.If(
+      ee.Algorithms.ObjectType(g).compareTo('Feature').eq(0),
+      ee.Feature(g).geometry(),
+      ee.Geometry(g)
+    )
+  );
+}
+
+function hasMinPoints(geomObj, minPoints) {
+  var geom = ee.Geometry(normalizeGeom(geomObj));
+
+  var coords = geom.coordinates().flatten();
+  var numPoints = coords.length();
+
+  return numPoints.gte(minPoints);  // returns ee.Boolean
+}
+
+function allGeomsHaveMinPoints(geomList, minPoints) {
+  geomList = ee.List(geomList);
+
+  var checks = geomList.map(function(g) {
+    return hasMinPoints(g, minPoints);  // ee.Boolean
+  });
+
+  return ee.List(checks).reduce(ee.Reducer.min());  // ee.Number (0 or 1)
+}
+
+// --- List of sampling geometries ---
+var samplingPointsList = [
+  Water_11,
+  Develop_NoStructure_20,
+  Develop_Open_21,
+  Develop_Low_22,
+  Develop_Medium_23,
+  Develop_High_24,
+  Barren_Land_31,
+  Deciduous_Forest_41,
+  Evergreen_Forest_42,
+  Mixed_Forest_43,
+  Shrub_52,
+  Grassland_71,
+  Pasture_81,
+  Cultivated_82,
+  Woody_Wetland_90,
+  Herbaceous_95
+];
+
+// --- Compute EE boolean (0/1) ---
+var sampleCheckEE = allGeomsHaveMinPoints(samplingPointsList, minPointsRequired);
+
+// --- Convert to real JS boolean NOW ---
+sampleCheckEE.evaluate(function(result) {
+  sampleCheckBool = (result === 1);
+  print("Sample Requirements: At Least " + minPointsRequired + " points?", sampleCheckBool);
+});
+
+var overall_model_rate = '';
+var kappa_model_rate = '';
+
+
+
+// ==================================================================================
+//                              UC PANEL (Code-2 STYLE SKIN)
+//                              (LOGIC UNCHANGED)
+// ==================================================================================
+
+// -------------------- Code-2-like skin constants --------------------
+var UI2 = {
+  width: '260px',
+  border: '1px solid #999999',
+  text: '#444444',
+  bg: 'white',
+  titleSize: '14px',
+  subSize: '9px',
+  labelSize: '10px',
+  btnSize: '11px'
+};
+
+function ui2Label(text, size, bold, margin) {
+  return ui.Label({
+    value: text,
+    style: {
+      fontSize: size || UI2.labelSize,
+      fontWeight: bold ? 'bold' : 'normal',
+      color: UI2.text,
+      margin: margin || '0px',
+      whiteSpace: 'pre'
+    }
+  });
+}
+
+function style2Select(sel, w) {
+  sel.style().set({
+    width: w || '120px',
+    fontSize: UI2.labelSize,
+    margin: '0px 6px 6px 0px'
+  });
+  return sel;
+}
+
+function style2Textbox(tb, w) {
+  tb.style().set({
+    width: w || '240px',
+    fontSize: UI2.labelSize,
+    margin: '0px 0px 6px 0px'
+  });
+  return tb;
+}
+
+function style2Checkbox(cb) {
+  cb.style().set({
+    fontSize: UI2.labelSize,
+    margin: '0px 0px 2px 0px',
+    color: 'black'
+  });
+  return cb;
+}
+
+function style2ButtonPrimary(btn) {
+  btn.style().set({
+    width: '240px',
+    color: 'black',
+    borderColor: 'darkgray',
+    borderWidth: '3px',
+    borderStyle: 'ridge',
+    margin: '6px 0px 6px 0px',
+    fontSize: UI2.btnSize
+  });
+  return btn;
+}
+
+function style2ButtonDanger(btn) {
+  btn.style().set({
+    width: '240px',
+    color: 'lightgray',
+    borderColor: 'lightgray',
+    borderWidth: '1px',
+    borderStyle: 'dotted',
+    margin: '0px 0px 2px 0px',
+    fontSize: UI2.labelSize
+  });
+  return btn;
+}
+
+function makeCollapsibleSection(title, innerPanel, startShown) {
+  var shown = !!startShown;
+  innerPanel.style().set('shown', shown);
+
+  var head = ui.Button({
+    label: (shown ? '▼ ' : '▶ ') + title,
+    onClick: function() {
+      shown = !shown;
+      innerPanel.style().set('shown', shown);
+      head.setLabel((shown ? '▼ ' : '▶ ') + title);
+    },
+    style: {
+      fontWeight: 'bold',
+      fontSize: '11px',
+      margin: '6px 0px 2px 0px',
+      textAlign: 'left',
+      stretch: 'horizontal',
+      width: '240px'
+    }
+  });
+
+  return ui.Panel({
+    widgets: [head, innerPanel],
+    layout: ui.Panel.Layout.flow('vertical'),
+    style: {margin: '0px 0px 4px 0px'}
+  });
+}
+
+// -------------------- Main content panel (this is your old controlPanel) --------------------
+var controlPanel = ui.Panel({
+  style: {
+    padding: '6px',
+    border: UI2.border,
+    width: UI2.width,
+    maxHeight: '70%',
+    backgroundColor: UI2.bg
+  }
+});
+
+// Title (same text, updated style only)
+var panelTitle = ui.Label({
+  value: 'Machine Learning Control Parameters',
+  style: {
+    fontWeight: 'bold',
+    fontSize: UI2.titleSize,
+    color: UI2.text,
+    margin: '0px 0px 4px 0px'
+  }
+});
+controlPanel.add(panelTitle);
+
+// Subtitle (same text, updated style only)
+var subTitle = ui.Label({
+  value:
+    'This Google Earth Engine (GEE) SMILE Random Forest toolkit requires you to\n' +
+    'always save your sample points and select the necessary image bands or\n' +
+    'features before running the classification model.\n\n' +
+    'NOTE: Save your project regularly to maintain data integrity.\n' +
+    'CREATED: Durga Joshi and Juan Campos (Nov, 2025)\n' +
+    'VERSION: 3.5',
+  style: {
+    fontWeight: 'normal',
+    fontSize: UI2.subSize,
+    color: UI2.text,
+    whiteSpace: 'pre',
+    margin: '0px 0px 8px 0px'
+  }
+});
+controlPanel.add(subTitle);
+
+// -------------------- SECTION: Project Variables (same logic) --------------------
+var projectSectionPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+
+projectSectionPanel.add(ui2Label('Project Variables:', '12px', true, '0px 0px 4px 0px'));
+
+var projectNameTextbox = ui.Textbox({
+  placeholder: 'Define Project Name (Input -or- Coded)',
+  value: project_name,
+  onChange: function(newValue) {
+    project_name = newValue;
+    print('Project Name Updated to:', project_name);
+  }
+});
+style2Textbox(projectNameTextbox, '240px');
+projectSectionPanel.add(projectNameTextbox);
+
+// Year select (same logic)
+var yearSelect = ui.Select({
+  placeholder: 'Select Year',
+  onChange: function(selected) {
+    targetYear = parseInt(selected, 10);
+    print('Updated targetYear:', targetYear);
+  }
+});
+style2Select(yearSelect, '120px');
+
+// Season select (same logic)
+var seasonSelect = ui.Select({
+  items: ['All', 'Spring', 'Summer', 'Fall', 'Spring_Summer'],
+  placeholder: 'Select Season',
+  value: 'All',
+  onChange: function(selected) {
+    MOSAIC_MODE_PRIMARY = selected;
+    print('Updated Season:', MOSAIC_MODE_PRIMARY);
+  }
+});
+style2Select(seasonSelect, '120px');
+
+// Put year + season on one row (visual only)
+var yearSeasonRow = ui.Panel({
+  widgets: [yearSelect, seasonSelect],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {margin: '0px 0px 0px 0px'}
+});
+projectSectionPanel.add(yearSeasonRow);
+
+// Populate years (same logic)
+YEAR_LIST.evaluate(function(yearArray) {
+  var items = yearArray.map(String);
+  yearSelect.items().reset(items);
+  yearSelect.setValue(String(targetYear), false);
+});
+
+// Console prints (unchanged)
+print('CODED PROJECT NAME:', project_name);
+print('YEAR:', targetYear);
+
+// -------------------- Counties (TRAIN / INFER) UI --------------------
+var trainLeftPanel = ui.Panel({
+  widgets: [ui.Label('TRAIN Counties', {fontSize:'11px', fontWeight:'bold', margin:'0px 0px 4px 0px'})]
+    .concat(trainCountyCheckboxes_1),
+  style: {padding:'4px', width:'120px', margin:'0px'}
+});
+
+var trainRightPanel = ui.Panel({
+  widgets: [ui.Label(' ', {whiteSpace:'pre'})].concat(trainCountyCheckboxes_2),
+  style: {padding:'4px', width:'120px', margin:'0px'}
+});
+
+var inferLeftPanel = ui.Panel({
+  widgets: [ui.Label('INFER Counties', {fontSize:'11px', fontWeight:'bold', margin:'6px 0px 4px 0px'})]
+    .concat(inferCountyCheckboxes_1),
+  style: {padding:'4px', width:'120px', margin:'0px'}
+});
+
+var inferRightPanel = ui.Panel({
+  widgets: [ui.Label(' ', {whiteSpace:'pre'})].concat(inferCountyCheckboxes_2),
+  style: {padding:'4px', width:'120px', margin:'0px'}
+});
+
+var trainRow = ui.Panel({
+  widgets: [trainLeftPanel, trainRightPanel],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {margin:'0px 0px 0px 0px'}
+});
+
+var inferRow = ui.Panel({
+  widgets: [inferLeftPanel, inferRightPanel],
+  layout: ui.Panel.Layout.flow('horizontal'),
+  style: {margin:'0px 0px 0px 0px'}
+});
+var countySectionPanel = ui.Panel({
+  style: {padding: '0px', margin: '0px 0px 8px 0px'}
+});
+
+
+// Add to your county section (or directly to controlPanel if you're not using sections)
+countySectionPanel.add(trainRow);
+countySectionPanel.add(inferRow);
+
+// -------------------- Bands toggle + list panel (RECREATED from Code 1) --------------------
+var bandsListPanel = ui.Panel({
+  widgets: [
+    ui.Label({
+      value: "Select Bands\n",
+      style: { fontSize: '11px', fontWeight: 'bold', margin: '0px 0px 2px 0px', whiteSpace: 'pre' }
+    })
+  ].concat(bandsCheckboxes),
+  style: {
+    padding: '4px',
+    width: '240px',
+    margin: '0px'
+  }
+});
+bandsListPanel.style().set('shown', false);
+
+var bandsToggleButton = ui.Button({
+  label: 'Show Bands',
+  onClick: function() {
+    var isShown = bandsListPanel.style().get('shown');
+    bandsListPanel.style().set('shown', !isShown);
+    bandsToggleButton.setLabel(isShown ? 'Show Bands' : 'Hide Bands');
+  },
+  style: {
+    width: '240px',
+    fontWeight: 'bold',
+    margin: '0px 0px 6px 0px',
+    fontSize: UI2.btnSize
+  }
+});
+
+
+// -------------------- SECTION: Band Selection (same logic) --------------------
+var bandSectionPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+
+// Keep your existing band toggle behavior unchanged:
+bandsToggleButton.style().set({
+  width: '240px',
+  fontWeight: 'bold',
+  margin: '0px 0px 6px 0px',
+  fontSize: UI2.btnSize
+});
+
+// Keep bandsListPanel exactly as you built it (we only adjust outer style)
+bandsListPanel.style().set({
+  padding: '4px',
+  width: '240px',
+  margin: '0px'
+});
+
+// Put the existing controls in this section
+// bandSectionPanel.add(bandsToggleButton);
+// bandSectionPanel.add(bandsListPanel);
+
+// -------------------- SECTION: Processing Parameters (same logic) --------------------
+var procSectionPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+
+// (same objects, just style)
+var randomforestParams = ui2Label('Processing Parameters', '12px', true, '0px 0px 6px 0px');
+procSectionPanel.add(randomforestParams);
+
+var UseMergedAssetCheckbox = ui.Checkbox({
+  label: 'External Samples: (HARD CODED LITERAL IMPORT ONLY)',
+  value: USE_MERGED_ASSET,
+  onChange: function(checked) {
+    USE_MERGED_ASSET = checked;
+    print('Use External Samples: ' + USE_MERGED_ASSET);
+  }
+});
+style2Checkbox(UseMergedAssetCheckbox);
+procSectionPanel.add(UseMergedAssetCheckbox);
+
+// External samples textbox (kept hidden as before)
+var externalSamplesTextbox = ui.Textbox({
+  placeholder: 'Enter Path',
+  value: external_samples_path,
+  onChange: function(newValue) {
+    external_samples_path = newValue;
+    print('External Samples Path:', external_samples_path);
+  }
+});
+externalSamplesTextbox.style().set({width: '240px', fontSize: '9px', margin: '0px 0px 6px 0px'});
+procSectionPanel.add(externalSamplesTextbox);
+externalSamplesTextbox.style().set('shown', false);
+
+// Show All Images (same logic)
+var showallimagesCheckbox = ui.Checkbox({
+  label: 'Show All Images',
+  value: SHOW_MOSAICS_ONLY,
+  onChange: function(checked) {
+    SHOW_MOSAICS_ONLY = checked;
+    print('Show All Images: ' + SHOW_MOSAICS_ONLY);
+    if (checked) {
+      runMachineLearningButton.setLabel('Show All Images');
+      exportallimagesCheckbox.style().set('shown', true);
+    } else {
+      runMachineLearningButton.setLabel('RUN: Random Forest MODEL');
+      exportallimagesCheckbox.style().set('shown', false);
+      exportallimagesCheckbox.setValue(false);
+      EXPORT_ALL_IMAGES = false;
+    }
+  }
+});
+style2Checkbox(showallimagesCheckbox);
+procSectionPanel.add(showallimagesCheckbox);
+
+// Export image (mosaic) checkbox (same logic)
+var exportallimagesCheckbox = ui.Checkbox({
+  label: 'Export Image',
+  value: EXPORT_ALL_IMAGES,
+  onChange: function(checked) {
+    EXPORT_ALL_IMAGES = checked;
+    print('EXPORT ALL IMAGES: ' + EXPORT_ALL_IMAGES);
+  }
+});
+style2Checkbox(exportallimagesCheckbox);
+exportallimagesCheckbox.style().set('shown', false);
+exportallimagesCheckbox.style().set('color', 'red');
+procSectionPanel.add(exportallimagesCheckbox);
+
+// Tune Mode (same logic)
+var tunemodelCheckbox = ui.Checkbox({
+  label: 'Tune Mode',
+  value: TUNE_MODEL,
+  onChange: function(checked) {
+    TUNE_MODEL = checked;
+    print('Tune Model: ' + TUNE_MODEL);
+    runMachineLearningButton.setLabel(checked ? 'RUN: Hyperparameter MODEL ' : 'RUN: Random Forest MODEL');
+  }
+});
+style2Checkbox(tunemodelCheckbox);
+procSectionPanel.add(tunemodelCheckbox);
+
+// Export classified (same logic)
+var exportImageCheckbox = ui.Checkbox({
+  label: 'Export Classified Image',
+  value: EXPORT_CLASSIFIED,
+  onChange: function(checked) {
+    EXPORT_CLASSIFIED = checked;
+    print('Export Image: ' + EXPORT_CLASSIFIED);
+  }
+});
+style2Checkbox(exportImageCheckbox);
+procSectionPanel.add(exportImageCheckbox);
+
+
+// Export trained RF model asset
+var exportModelCheckbox = ui.Checkbox({
+  label: 'Export Final RF Model Asset',
+  value: EXPORT_FINAL_MODEL,
+  onChange: function(checked) {
+    EXPORT_FINAL_MODEL = checked;
+    print('Export Final RF Model Asset: ' + EXPORT_FINAL_MODEL);
+
+    // Show metadata option only when model export is enabled
+    exportModelMetadataCheckbox.style().set('shown', checked);
+
+    if (!checked) {
+      EXPORT_MODEL_METADATA = false;
+      exportModelMetadataCheckbox.setValue(false, false);
+    }
+  }
+});
+style2Checkbox(exportModelCheckbox);
+procSectionPanel.add(exportModelCheckbox);
+
+// Optional metadata export
+var exportModelMetadataCheckbox = ui.Checkbox({
+  label: 'Export Model Metadata CSV',
+  value: EXPORT_MODEL_METADATA,
+  onChange: function(checked) {
+    EXPORT_MODEL_METADATA = checked;
+    print('Export Model Metadata CSV: ' + EXPORT_MODEL_METADATA);
+  }
+});
+style2Checkbox(exportModelMetadataCheckbox);
+exportModelMetadataCheckbox.style().set('shown', EXPORT_FINAL_MODEL);
+procSectionPanel.add(exportModelMetadataCheckbox);
+
+
+
+// Reset mode (same logic)
+var resetSamplesCheckbox = ui.Checkbox({
+  label: 'Enable Reset Mode',
+  onChange: function(checked) {
+    if (checked) {
+      createNewClassesButton.setDisabled(false);
+      createNewClassesButton.style().set('shown', true);
+      createNewClassesButton.style({ textColor: 'red', borderColor: 'red' });
+    } else {
+      createNewClassesButton.setDisabled(true);
+      createNewClassesButton.style().set('shown', false);
+      createNewClassesButton.style({ textColor: 'lightgray', borderColor: 'lightgray' });
+    }
+  }
+});
+style2Checkbox(resetSamplesCheckbox);
+procSectionPanel.add(resetSamplesCheckbox);
+
+// Show RF params (same logic)
+var showRandomForestPARMSCheckbox = ui.Checkbox({
+  label: 'Edit Random Forest Parameters',
+  onChange: function(checked) {
+    numberTreesSliderLabel.style().set('shown', checked);
+    numberTreesSlider.style().set('shown', checked);
+    minLeafPopSliderLabel.style().set('shown', checked);
+    minLeafPopSlider.style().set('shown', checked);
+    bagFractionSliderLabel.style().set('shown', checked);
+    bagFractionSlider.style().set('shown', checked);
+    varSplitSliderLabel.style().set('shown', checked);
+    varSplitSlider.style().set('shown', checked);
+  }
+});
+style2Checkbox(showRandomForestPARMSCheckbox);
+showRandomForestPARMSCheckbox.style().set('margin', '0px 0px 8px 0px');
+procSectionPanel.add(showRandomForestPARMSCheckbox);
+
+// Sliders (same logic; style only)
+var numberTreesSliderLabel = ui.Label('Number of Trees:', {fontSize: '10px', fontWeight: 'bold'});
+var numberTreesSlider = ui.Slider({
+  min: 50, max: 300, value: initialnumberOfTrees, step: 50,
+  style: {width: '240px', margin: '0px 0px 10px 0px'},
+  onChange: function(newValue) {
+    numberOfTrees = newValue;
+    print('Updated numberOfTrees:', numberOfTrees);
+  }
+});
+procSectionPanel.add(numberTreesSliderLabel); numberTreesSliderLabel.style().set('shown', false);
+procSectionPanel.add(numberTreesSlider);      numberTreesSlider.style().set('shown', false);
+
+var minLeafPopSliderLabel = ui.Label('Min Leaf Population:', {fontSize: '10px', fontWeight: 'bold'});
+var minLeafPopSlider = ui.Slider({
+  min: 1, max: 4, value: initialminLeafPopulation, step: 1,
+  style: {width: '240px', margin: '0px 0px 10px 0px'},
+  onChange: function(newValue) {
+    minLeafPopulation = newValue;
+    print('Updated minLeafPopulation:', minLeafPopulation);
+  }
+});
+procSectionPanel.add(minLeafPopSliderLabel); minLeafPopSliderLabel.style().set('shown', false);
+procSectionPanel.add(minLeafPopSlider);      minLeafPopSlider.style().set('shown', false);
+
+var bagFractionSliderLabel = ui.Label('Bag Fraction:', {fontSize: '10px', fontWeight: 'bold'});
+var bagFractionSlider = ui.Slider({
+  min: 0.1, max: 1.0, value: initialbagFraction, step: 0.01,
+  style: {width: '240px', margin: '0px 0px 10px 0px'},
+  onChange: function(newValue) {
+    bagFraction = newValue;
+    print('Updated bagFraction:', bagFraction);
+  }
+});
+procSectionPanel.add(bagFractionSliderLabel); bagFractionSliderLabel.style().set('shown', false);
+procSectionPanel.add(bagFractionSlider);      bagFractionSlider.style().set('shown', false);
+
+var varSplitSliderLabel = ui.Label('Variable per Split:', {fontSize: '10px', fontWeight: 'bold'});
+var varSplitSlider = ui.Slider({
+  min: 3, max: 14, value: initialvariablesPerSplit, step: 1,
+  style: {width: '240px', margin: '0px 0px 10px 0px'},
+  onChange: function(newValue) {
+    variablesPerSplit = newValue;
+    print('Updated Variable Split:', variablesPerSplit);
+  }
+});
+procSectionPanel.add(varSplitSliderLabel); varSplitSliderLabel.style().set('shown', false);
+procSectionPanel.add(varSplitSlider);      varSplitSlider.style().set('shown', false);
+
+// Results labels (same logic; style only)
+var overallResultLabel = ui.Label({
+  value: 'Model Metric:',
+  style: {fontWeight: 'bold', fontSize: '11px', color: 'lightgray', whiteSpace: 'pre', margin: '6px 0px 0px 0px'}
+});
+var kapaResultLabel = ui.Label({
+  value: 'Kappa Statistics:',
+  style: {fontWeight: 'bold', fontSize: '11px', color: 'lightgray', whiteSpace: 'pre', margin: '0px 0px 6px 0px'}
+});
+
+// -------------------- Buttons (same logic) --------------------
+var hide_reset = true;
+
+var confirmButton = ui.Button({
+  label: 'ARE YOU SURE? ==> ALL SAMPLES WILL BE DELETED!! --  To Cancel, Refresh Webpage.',
+  onClick: function() {
+    mapSetup();
+    Map.remove(confirmButton);
+  },
+  style: {
+    position: 'top-center',
+    margin: '0 0 0 0',
+    color: 'red',
+    backgroundColor: '#FF0000',
+    fontSize: '30 px',
+    fontWeight: 'bold',
+    padding: '10px 10px'
+  }
+});
+Map.add(confirmButton);
+confirmButton.style().set('shown', false);
+
+var runMachineLearningButton = ui.Button({
+  label: 'RUN: Random Forest MODEL',
+  onClick: function() {
+    runMachineLearningButton.setDisabled(true);
+  
+    if (TRAIN_SELECTED_COUNTIES.length === 0) {
+      print('Please select at least one TRAIN county.');
+      runMachineLearningButton.setDisabled(false);
+      return;
+    }
+    if (INFER_SELECTED_COUNTIES.length === 0) {
+      print('Please select at least one INFER county.');
+      runMachineLearningButton.setDisabled(false);
+      return;
+    }
+  
+    // External samples OR drawn samples
+    if (USE_MERGED_ASSET || sampleCheckBool === true) {
+      run_ml_model(SELECTED_BANDS);
+      runMachineLearningButton.setDisabled(false);
+      return;
+    }
+  
+    print("ERROR: Minimum samples requirement not met.");
+    runMachineLearningButton.setDisabled(false);
+
+  }
+});
+style2ButtonPrimary(runMachineLearningButton);
+
+var createNewClassesButton = ui.Button({
+  label: 'WARNING!! Create New Classes',
+  onClick: function(check) {
+    hide_reset = check;
+    if (hide_reset) {
+      confirmButton.style().set('shown', true);
+    } else {
+      confirmButton.style().set('shown', false);
+    }
+  }
+});
+style2ButtonDanger(createNewClassesButton);
+createNewClassesButton.setDisabled(true);
+createNewClassesButton.style().set('shown', false);
+
+// Add results labels near bottom (same behavior)
+procSectionPanel.add(overallResultLabel);
+procSectionPanel.add(kapaResultLabel);
+
+// -------------------- Add sections to control panel --------------------
+controlPanel.add(makeCollapsibleSection('Project',   projectSectionPanel, false));
+controlPanel.add(makeCollapsibleSection('Counties',  countySectionPanel,  true));
+controlPanel.add(makeCollapsibleSection('Bands',     bandSectionPanel,    false));
+controlPanel.add(makeCollapsibleSection('Options',   procSectionPanel,    false));
+
+// Footer buttons (same widgets)
+controlPanel.add(runMachineLearningButton);
+controlPanel.add(createNewClassesButton);
+
+// -------------------- Wrapper toggle (Code-2 look) --------------------
+var panelShown = true;
+var toggleBtn = ui.Button({
+  label: '▼ Control Panel',
+  onClick: function() {
+    panelShown = !panelShown;
+    controlPanel.style().set('shown', panelShown);
+    toggleBtn.setLabel((panelShown ? '▼' : '▶') + ' Control Panel');
+  },
+  style: {
+    width: UI2.width,
+    fontWeight: 'bold',
+    fontSize: '11px',
+    textAlign: 'left',
+    margin: '0px',
+    border: UI2.border,
+    backgroundColor: UI2.bg
+  }
+});
+
+// Final wrapper (bottom-right)
+var wrapperPanel = ui.Panel({
+  widgets: [toggleBtn, controlPanel],
+  style: {
+    position: 'bottom-right',
+    padding: '0px',
+    backgroundColor: 'rgba(255,255,255,0.0)'
+  }
+});
+Map.add(wrapperPanel);
+
+// -------------------- Left Panel (keep your legend exactly the same) --------------------
+var leftPanel = ui.Panel({
+  widgets: [
+    ui.Label(' Random Forest Application', {fontWeight: 'bold', fontSize: '24px'}),
+    legend,
+    // (bandsToggleButton + bandsListPanel already exist; we keep them here too)
+    // If you prefer bands only on the right, remove the next 2 lines.
+    // Keeping them here preserves Code-1 layout and does not change logic.
+    // NOTE: This is STYLE ONLY; legend stays unchanged.
+    // If you want exactly Code-2 single-panel feel, tell me and I’ll move bands into right only.
+    bandsToggleButton,
+    bandsListPanel
+  ],
+  style: {
+    padding: '2px',
+    border: '1px solid #999999',
+    width: '320px',
+    position: 'bottom-left'
+  }
+});
+Map.add(leftPanel);
+
+
+
+
+
+// ==================================================================================
+//                              CLASS CREATION
+// ==================================================================================
+function mapSetup() {
+  Map.setOptions('TERRAIN');
+  
+  // A default geometry polygon provided in the user's snippet.
+  var coords = [
+    [-99.969876, 29.257456],
+    [-99.101957, 29.257456],
+    [-99.1957,29.9737797],
+    [-99.969876,29.973779],
+    [-99.969876, 29.257456]
+  ];
+    
+  var geometry = ee.Geometry.Polygon(coords);
+    
+  // Initialize and clear drawing tools.
+  var drawingTools = Map.drawingTools();
+  drawingTools.setShown(true);
+  while (drawingTools.layers().length() > 0) {
+    var layer = drawingTools.layers().get(0);
+    drawingTools.layers().remove(layer);
+  }
+      
+  // // Add layers for potential classification (Developed, Forest, etc.)
+  // drawingTools.addLayer([], 'Water_11', '5475A8');
+  // drawingTools.addLayer([], 'Develop_NoStructure_20', 'DCDCDC');
+  // drawingTools.addLayer([], 'Develop_Open_21', 'E8D1D1');
+  // drawingTools.addLayer([], 'Develop_Low_22', 'E29E8C');
+  // drawingTools.addLayer([], 'Develop_Medium_23', 'FF0000');
+  // drawingTools.addLayer([], 'Develop_High_24', 'B50000');
+  // drawingTools.addLayer([], 'Barren_Land_31', 'D2CDC0');
+  // drawingTools.addLayer([], 'Deciduous_Forest_41', '85C77E');
+  // drawingTools.addLayer([], 'Evergreen_Forest_42', '38814E');
+  // drawingTools.addLayer([], 'Mixed_Forest_43', 'D4E7B0');
+  // drawingTools.addLayer([], 'Shrub_52', 'AF963C');
+  // drawingTools.addLayer([], 'Grassland_71', 'FDE9AA');
+  // drawingTools.addLayer([], 'Pasture_81', 'FBF65D');
+  // drawingTools.addLayer([], 'Cultivated_82', 'CA9146');
+  // drawingTools.addLayer([], 'Woody_Wetland_90', 'C8E6F8');
+  // drawingTools.addLayer([], 'Herbaceous_95', '64B3D5');
+      
+  // drawingTools.setShape('point');
+  //drawingTools.addLayer([geometry], 'geometry', 'FF0000');
+      
+  //drawingTools.setShape('polygon');
+      
+  return drawingTools;
+}
+
+
+// ==================================================================================
+//                              MACHINE LEARNING
+// ==================================================================================
+function run_ml_model(processing_bands) {
+      
+      // ==== Summer RGB mosaic (separate from ML stack) =========================
+    function buildS2_RGB(dateRange, aoi, cloudPct) {
+      var rgbCol = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterDate(dateRange)
+        .filterBounds(aoi)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloudPct))
+        .map(maskS2clouds)
+        .map(scaleSentinel2)
+        .select(['B4', 'B3', 'B2']);   // TRUE RGB
+    
+      rgbCol = resampleCollectionTo10m(rgbCol);
+    
+      return rgbCol.median().clip(aoi);
+    }
+
+  
+
+    processing_bands = FINAL_MODEL_BANDS.slice();
+  // ==================================================================================
+  //                              External Assets 
+  // ==================================================================================
+  if (USE_MERGED_ASSET) {
+    print("Trying External Samples...");
+    
+    //var mod = require('users/jmarcelc/Repo:HGAC_WesternSamples_Campos'); 
+  
+    try {
+      // Attempt to load the module and assign it to the pre-declared 'mod' variable
+      print('Module loaded:', external_samples_path);
+      // print(mod); // Optional: Use this to inspect the content of the loaded module
+    } catch (err) {
+      // This runs if the path is invalid, permissions are denied, or the module crashes
+      print('Require() failed:', err);
+    }
+  
+    // Check if the module load attempt was successful
+    if (!mod) {
+      print('Module is undefined — stopping override. Using default top imports.');
+    } else {
+      // --- Module loaded successfully, proceed to check contents and override ---
+  
+      function check(name) {
+        // Check if the required field exists in the loaded module
+        var ok = mod[name] !== undefined;
+        print('Field:', name + (ok ? ' - PRESENT' : ' - MISSING!'));
+        return ok;
+      }
+  
+      // List of required variables (must match the module's exports)
+      var required = [
+        'B2',
+        'B3',
+        'B4',
+        'B8',
+        'B11',
+        'B12',
+        'B_NDRE',
+        'B_NDVI',
+        'B_MNDWI',
+        'B_BAEI',
+        'B_COMBO_VEG',
+        'B_SLOPE',
+        'B8_GLCM_var',
+        'B_MOISTURE',
+        'B_SWIR_COMBO',
+        'B_TWI',
+        'B_VH_StdDev',
+        'B_VV_StdDev',
+        'B_RVI',
+        'B_PASTURE_PROB',
+        'B_TCW'
+      ];
+  
+      var allOK = true;
+      required.forEach(function(name) {
+        if (!check(name)) allOK = false;
+      });
+  
+      if (!allOK) {
+        print('Some required fields missing — NOT overriding imports. Using default top imports.');
+      } else {
+        print('All fields present — OVERRIDING imports.');
+  
+        // CRITICAL FIX: No 'var' used here. Reassigns the global variables 
+        // created by the top GEE import section.
+        Water_11             = mod.Water_11;
+        Develop_NoStructure_20 = mod.Develop_20; // This assumes mod.Develop_20 is correctly named Develop_NoStructure_20 in the top imports
+        Develop_Open_21      = mod.Develop_21;
+        Develop_Low_22       = mod.Develop_22;
+        Develop_Medium_23    = mod.Develop_23;
+        Develop_High_24      = mod.Develop_24;
+        Barren_Land_31       = mod.Barren_Land_31;
+        Deciduous_Forest_41  = mod.Deciduous_Forest_41;
+        Evergreen_Forest_42  = mod.Evergreen_Forest_42;
+        Mixed_Forest_43      = mod.Mixed_Forest_43;
+        Shrub_52             = mod.Shrub_52;
+        Grassland_71         = mod.Grassland_71;
+        Pasture_81           = mod.Pasture_81;
+        Cultivated_82        = mod.Cultivated_82;
+        Woody_Wetland_90     = mod.Woody_Wetland_90;
+        Herbaceous_95        = mod.Herbaceous_95;
+      }
+    }
+  }
+  // var mod = require('users/jmarcelc/Repo:HGAC_WesternSamples_Campos');  // <== Test
+
+  
+
+// =======================================================================
+// COUNTY LISTS: TRAIN vs INFER (3-digit -> 5-digit GEOID)
+var inferGEOIDs = ee.List(INFER_SELECTED_COUNTIES.map(function(fips3) {
+  return '48' + fips3;
+}));
+
+var trainGEOIDs = ee.List(TRAIN_SELECTED_COUNTIES.map(function(fips3) {
+  return '48' + fips3;
+}));
+
+// =======================================================================
+// LOAD TIGER COUNTIES
+var TIGER_COUNTIES_FC = ee.FeatureCollection("TIGER/2018/Counties");
+var STATE_FIPS = "48"; // Texas
+
+// =======================================================================
+// GENERATE INFERENCE AOI from INFER counties
+function generateAOI(selectedGEOIDs) {
+  var counties = TIGER_COUNTIES_FC
+    .filter(ee.Filter.eq("STATEFP", STATE_FIPS))
+    .filter(ee.Filter.inList("GEOID", selectedGEOIDs));
+
+  var geom = ee.Algorithms.If(
+    counties.size().gt(0),
+    counties.geometry().dissolve({maxError: 1}),
+    ee.Geometry.Point([-95.3698, 29.7604])
+  );
+
+  return {
+    geometry: ee.Geometry(geom),
+    features: counties
+  };
+}
+
+var aoiResult     = generateAOI(inferGEOIDs);
+var geometry      = aoiResult.geometry;
+var aoiCountiesFC = aoiResult.features;
+
+// Show inference counties boundary
+Map.addLayer(
+  aoiCountiesFC.style({color: "000000", fillColor: "00000000", width: 2}),
+  {},
+  "INFER Region of Classification"
+);
+
+Map.centerObject(geometry, 9);
+
+// =======================================================================
+// TRAINING counties FC from TRAIN counties
+var trainCountiesFC = TIGER_COUNTIES_FC
+  .filter(ee.Filter.eq("STATEFP", STATE_FIPS))
+  .filter(ee.Filter.inList("GEOID", trainGEOIDs));
+
+Map.addLayer(
+  trainCountiesFC.style({color: "00AAFF", fillColor: "00AAFF00", width: 2}),
+  {},
+  "TRAIN Counties",
+  false
+);
+
+// =======================================================================
+// TRAINING BUFFER
+var TRAIN_BUFFER_KM = 3;
+var TRAIN_BUFFER_M  = TRAIN_BUFFER_KM * 1000;
+
+var trainBufferGeom = trainCountiesFC.geometry()
+  .dissolve({maxError: 1})
+  .buffer(TRAIN_BUFFER_M);
+
+function clipToTrainBuffer(fc) {
+  return fc.filterBounds(trainBufferGeom);
+}
+
+// =======================================================================
+// PROCESSING AOI = union of inference AOI + training buffer
+var processingGeometry = ee.Geometry(geometry).union(trainBufferGeom, 1);
+  
+var trainBufferGeom = trainCountiesFC.geometry()
+  .dissolve({maxError: 1})
+  .buffer(TRAIN_BUFFER_M);
+
+function clipToTrainBuffer(fc) {
+  return fc.filterBounds(trainBufferGeom);
+}
+
+// =======================================================================
+// PROCESSING AOI = union of inference AOI + training buffer
+var processingGeometry = ee.Algorithms.If(
+  geometry,
+  geometry.union(trainBufferGeom, 1),
+  trainBufferGeom
+);
+
+// Add to Map
+Map.addLayer(
+  ee.FeatureCollection(trainBufferGeom).style({
+    color: "00FF00",
+    fillColor: "00FF0040",
+    width: 2
+  }),
+  {},
+  "Training buffer (" + TRAIN_BUFFER_KM + " km)",
+  false
+);
+  
+  // Build + plot Summer RGB
+var ranges = createDateRanges(targetYear);
+layerSummerRGB = buildS2_RGB(ranges[1], processingGeometry, MAX_CLOUD_PERCENT);
+
+
+Map.addLayer(
+  layerSummerRGB,
+  {bands: ['B4', 'B3', 'B2'], min: 0.02, max: 0.30},
+  'Sentinel-2 Summer RGB',
+  true
+);
+
+// Show Region Measures
+var processingAreaSqKm = ee.Number(ee.Geometry(processingGeometry).area())
+  .divide(1e6)
+  .multiply(100).round().divide(100);
+print("Processing AOI area (sq km):", processingAreaSqKm);
+
+
+// =======================================================================
+// 2) VIS PARAMS + CLASS LABELS
+// =======================================================================
+
+var visRGB = {bands: ['B4','B3','B2'], min: 0.02, max: 0.3};
+
+var classPalette = [
+  '#0062a8','#d2d2d2','#e99d9d','#ff0000','#cc0000','#990000',
+  '#f1cf24','#85C77E','#38814E','#809f71','#dad41d','#68fd24',
+  '#FBF65D','#CA9146','#C8E6F8','#64B3D5'
+];
+
+var classLabels = [
+  '1  Water (NLCD 11)',
+  '2  Developed, Non-Structures (NLCD 20)',
+  '3  Developed, Open Space (NLCD 21)',
+  '4  Developed, Low Intensity (NLCD 22)',
+  '5  Developed, Medium Intensity (NLCD 23)',
+  '6  Developed, High Intensity (NLCD 24)',
+  '7  Barren Land (NLCD 31)',
+  '8  Deciduous Forest (NLCD 41)',
+  '9  Evergreen Forest (NLCD 42)',
+  '10 Mixed Forest (NLCD 43)',
+  '11 Shrub/Scrub (NLCD 52)',
+  '12 Grassland/Herbaceous (NLCD 71)',
+  '13 Pasture/Hay (NLCD 81)',
+  '14 Cultivated Crops (NLCD 82)',
+  '15 Woody Wetlands (NLCD 90)',
+  '16 Herbaceous Wetlands (NLCD 95)'
+];
+
+
+// =======================================================================
+// 3) CORE FUNCTIONS: CLOUD MASK, SCALING, DATES
+// =======================================================================
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask  = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+              .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+function scaleSentinel2(image) {
+  var optical = image.select('B.*').divide(10000);
+  return image.addBands(optical, null, true);
+}
+
+function createDateRanges(year) {
+  var r1 = ee.DateRange(ee.Date.fromYMD(year, 1, 1),  ee.Date.fromYMD(year, 4, 30));
+  var r2 = ee.DateRange(ee.Date.fromYMD(year, 5, 1),  ee.Date.fromYMD(year, 8, 31));
+  var r3 = ee.DateRange(ee.Date.fromYMD(year, 9, 1),  ee.Date.fromYMD(year,12,31));
+  return [r1, r2, r3];
+}
+
+function safeProjection(image) {
+  var tryBands = ee.List(['B2','B3','B4','B8','B11','B12']);
+
+  // Build a list of available bands using iterate (server-safe)
+  var available = ee.List(
+    tryBands.iterate(function(b, acc) {
+      b = ee.String(b);
+      return ee.Algorithms.If(
+        image.bandNames().contains(b),
+        ee.List(acc).add(b),
+        acc
+      );
+    }, ee.List([]))
+  );
+
+// Choose the first available band or fallback to the first band in the image
+var chosenBand = ee.Algorithms.If(
+  available.size().gt(0),
+  available.get(0),
+  image.bandNames().get(0)
+);
+
+// Safe one-band selection → valid projection
+return image.select(ee.String(chosenBand)).projection();
+}
+
+function resampleCollectionTo10m(col) {
+  return ee.ImageCollection(col).map(function(img) {
+    var proj10 = safeProjection(img);
+    return img
+      .resample('bilinear')
+      .reproject({crs: proj10, scale: 10});
+  });
+}
+
+// =======================================================================
+// 4) GLCM TEXTURE + DERIVED BANDS (ALL-IN-ONE)
+// =======================================================================
+  function addGLCM(image, texture_type, band) {
+      var kernel_size = 3;
+      
+      var src = image.select(band)
+        .unmask(0) 
+        .multiply(255) 
+        .toInt16();
+  
+      var glcm = src.glcmTexture({
+          size: kernel_size,
+      });
+  
+      // 3. SAFE BAND SELECTION AND RENAMING
+      var expected = band + '_' + texture_type;
+      var finalBandName = band + '_GLCM_' + texture_type;
+  
+      var safe = ee.Algorithms.If(
+        glcm.bandNames().contains(expected),
+        glcm.select(expected).rename(finalBandName),
+        ee.Image(0).rename(finalBandName)
+      );
+  
+      return image.addBands(safe);
+  }
+
+function addAllDerivedBands(image) {
+  image = scaleSentinel2(image);
+  
+  // (Your existing spectral variables: blue, green, red, nir, etc...)
+  var blue  = image.select('B2');
+  var green = image.select('B3');
+  var red   = image.select('B4');
+  var nir   = image.select('B8');
+  var nir8a = image.select('B8A');
+  var swir1 = image.select('B11');
+  var swir2 = image.select('B12');
+  
+  // (Your existing indices math: mndwi, bsi, evi2, etc...)
+  var ndvi = image.normalizedDifference(['B4', 'B8']).rename('NDVI');
+  var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var mndwi = image.normalizedDifference(['B3','B11']).rename('B_MNDWI');
+  var ndmi  = image.normalizedDifference(['B8A','B11']).rename('B_NDMI');
+  //var ndbi  = image.normalizedDifference(['B11','B8']).rename('B_NDBI');  
+  var evi2  = image.expression('2.5*(NIR-RED)/(NIR+2.4*RED+1.0)', {NIR: nir, RED: red}).rename('B_EVI2');
+  var ndre  = image.normalizedDifference(['B8A','B5']).rename('B_NDRE');
+  var lswi  = image.expression('(B8 - B11) / (B8 + B11)', {'B8': nir, 'B11': swir1}).rename('B_LSWI');
+  var nbr    = image.normalizedDifference(['B8','B12']).rename('B_NBR');
+  
+  // SWIR Combinations
+  var swir_r = image.expression('(B11) / (B12)', {'B11': swir1, 'B12': swir2}).rename('B_SWIR_Ratio'); 
+  var clay   = image.expression('(B8 + B11) / B12', {'B8': nir, 'B11': swir1, 'B12': swir2}).rename('B_ClayMineralIndex');
+  var swir = clay.add(swir_r).divide(2).rename('B_SWIR_COMBO');
+  var waterMask = ndwi.gt(0.1);
+  
+  // === BAEI =====================================================
+  var baeiRaw = image.expression('(B4 + 0.3) / (B3 + B11)', {
+    'B4': image.select('B4'), 
+    'B3': image.select('B3'), 
+    'B11': image.select('B11')
+  }).rename('B_BAEI');
+  
+  var baei = baeiRaw.where(ndwi.gt(0), 0).rename('B_BAEI');
+  
+  baei = baei.where(baei.gt(2), 2);
+  
+  // === Tasseled Cap Wetness (TCW) =====================================
+  var tcw = image.expression(
+    '(0.1509 * B2) + (0.1973 * B3) + (0.3283 * B4) + (0.3407 * B8) - (0.7117 * B11) - (0.4559 * B12)', {
+      'B2': blue,
+      'B3': green,
+      'B4': red,
+      'B8': nir,
+      'B11': swir1,
+      'B12': swir2
+  }).rename('B_TCW');
+
+
+  // === Moisture =====================================================
+  var glcm_var = addGLCM(ndmi, 'var', 'B_NDMI').select('B_NDMI_GLCM_var');
+  var glcm_rescaled = glcm_var.unitScale(0, 0.1); // Adjust 0.1 based on your new stats
+  
+  var moisture = ndmi.add(glcm_rescaled).divide(2).rename('B_MOISTURE');
+  moisture = moisture.where(ndwi.gt(0), -1);
+  
+  
+  // === BSDI =====================================================
+  var dryness = image.expression(
+    '((B11 + B4) - (B8 + B2)) / ((B11 + B4) + (B8 + B2))', {
+      'B11': image.select('B11'),
+      'B4': image.select('B4'),
+      'B8': image.select('B8'),
+      'B2': image.select('B2')
+  }).rename('B_DRYNESS');
+  
+  var comboVeg = image.expression('(EVI * (LSWI + NBR)) / 2', {
+    'EVI': evi2,
+    'LSWI': lswi,
+    'NBR': nbr
+  }).rename('B_COMBO_VEG');
+  
+  var pastureIndex = comboVeg.subtract(dryness).rename('B_PASTURE_PROB');
+  
+  var finalPastureBand = pastureIndex
+    .where(waterMask, -5)
+    .rename('B_PASTURE_PROB');
+  
+  finalPastureBand = finalPastureBand.unmask(-5);
+  
+
+
+  // === Elevation =====================================================
+  var elevation = ee.Image("USGS/NED"); 
+  var studyArea = image.geometry();
+  var targetProjection = image.select('B2').projection();
+  
+  var slopeRad = ee.Terrain.slope(elevation)
+    .multiply(Math.PI / 180)
+    .rename('B_SLOPE')
+    .clip(studyArea);
+    
+  slopeRad = slopeRad.focal_mean(30, 'circle', 'meters').rename('B_SLOPE');
+  
+  var flowAcc90m = ee.Image('WWF/HydroSHEDS/15ACC').select('b1').clip(studyArea);
+  
+  var flowAcc10m = flowAcc90m
+    .resample('bilinear') 
+    .reproject({
+      crs: targetProjection,
+      scale: 10
+    });
+  
+  var TWI = flowAcc10m
+    .divide(slopeRad.add(0.001))
+    .add(1)
+    .log()
+    .rename('B_TWI');
+  
+  TWI = TWI.focal_mean(60, 'circle', 'meters').unmask(0);
+  
+  slopeRad = slopeRad.unmask(0);
+  TWI = TWI.unmask(0);
+  
+  TWI = TWI
+    .resample('bilinear')
+    .unmask(0)
+    .reproject({crs: targetProjection, scale: 10});
+  
+  slopeRad = slopeRad
+    .unmask(0)
+    .reproject({crs: targetProjection, scale: 10});
+    
+    
+  
+  // === Sentinel-1  =====================================================
+  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(image.geometry())
+    .filterDate(image.date().advance(-1, 'month'), image.date().advance(1, 'month'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .select(['VV', 'VH']);
+  
+  var emptyImage = ee.Image([0, 0, 0, 0])
+    .rename(['B_VV_VH_Ratio', 'B_RVI', 'B_VV_StdDev', 'B_VH_StdDev'])
+    .unmask(0); 
+  
+  var s1Stack = ee.Image(ee.Algorithms.If(
+    s1.size().gt(0),
+    (function() {
+      var s1Mean = s1.mean();
+      
+      // 1. Log-RVI Math (Surgical Fix: Renamed to match return)
+      var vhPower = s1Mean.select('VH').divide(10).pow(10);
+      var vvPower = s1Mean.select('VV').divide(10).pow(10);
+      var denominator = vvPower.add(vhPower).add(0.0001);
+      var rviLinear = vhPower.multiply(4).divide(denominator);
+      
+      // Convert to log scale and clean
+      var rvi = rviLinear.add(1).log10().rename('B_RVI');
+      rvi = rvi.where(rvi.gt(2), 2).unmask(0);
+      
+      // 2. StdDev Math
+      var std = s1.reduce(ee.Reducer.stdDev())
+        .rename(['B_VV_StdDev', 'B_VH_StdDev'])
+        .unmask(0);
+  
+      return rvi.addBands(std);
+    })(),
+
+    emptyImage.select(['B_RVI', 'B_VV_StdDev', 'B_VH_StdDev'])
+  )).clip(image.geometry());
+  
+  s1Stack = s1Stack.setDefaultProjection(targetProjection, null, 10);
+  var finalImage = image.addBands(s1Stack);
+
+
+  // Final Assembly with Band Names
+  var final_stack = image.addBands([
+    ndvi,
+    mndwi,            // B_MNDWI
+    ndre,             // B_NDRE
+    baei,             // B_BAEI
+    moisture,         // B_MOISTURE
+    swir,             // B_SWIR_COMBO
+    nir,              // B8
+    blue,             // B2
+    TWI,              // B_TWI
+    s1Stack,          // B_RVI, B_VV_StdDev, B_VH_StdDev
+    comboVeg,         // B_COMBO_VEG
+    slopeRad.unmask(0), // B_SLOPE
+    finalPastureBand,  // B_PASTURE_PROB
+    tcw               // B_TCW
+  ]);
+
+  // 1. Run GLCM on the full-precision stack
+  final_stack = addGLCM(final_stack, 'var', 'B8');
+  
+  // 2. Surgical Fix: Round the entire stack to 5 decimal places at the very end
+  var rounded_stack = final_stack.multiply(100000).round().divide(100000);
+  return rounded_stack.select(processing_bands);
+
+  
+  // 3. Select your bands from the rounded result
+  return rounded_stack.select(processing_bands);
+}
+
+
+
+
+// =======================================================================
+// 7) FAST MOSAIC + STACK
+// =======================================================================
+function createS2Mosaic(dateRange, aoi, cloudPct, label) {
+  var col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterDate(dateRange)
+  .filterBounds(aoi)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloudPct))
+  .map(maskS2clouds)
+  .map(addAllDerivedBands);
+
+  col = resampleCollectionTo10m(col);
+
+  // SAFETY: If empty → return a 0-value placeholder image
+  col = ee.ImageCollection(ee.Algorithms.If(
+    col.size().gt(0),
+    col,
+    ee.Image(0).rename(processing_bands).selfMask()
+  ));
+
+  var mosaic = col.median().clip(aoi);
+  return mosaic;
+}
+
+// Consolidates a list of images into one image stack (averaged)
+function consolidateImages(list) {
+  list = ee.List(list);
+  var count = list.size();
+
+  var stacked = ee.Image(ee.Algorithms.If(
+    count.eq(0),
+    ee.Image(0).select().rename(processing_bands).selfMask(),
+    ee.ImageCollection(list).reduce(ee.Reducer.mean())
+  ));
+
+  // Rename bands back to original processing bands
+  // This prevents "_mean" suffix issues
+  var consol_image =  stacked.select(stacked.bandNames(), processing_bands);
+  print(consol_image);
+  
+  return consol_image;
+}
+
+
+// Build seasonal image stack for a given mode
+function ImageryCompilation(mode, aoi) {
+  var ranges = createDateRanges(targetYear); // Your seasonal date ranges
+  var mosaic;
+
+  switch(mode) {
+    case 'Spring':
+      mosaic = createS2Mosaic(ranges[0], aoi, MAX_CLOUD_PERCENT, 'Spring');
+      break;
+    case 'Summer':
+      mosaic = createS2Mosaic(ranges[1], aoi, MAX_CLOUD_PERCENT, 'Summer');
+      break;
+    case 'Fall':
+      mosaic = createS2Mosaic(ranges[2], aoi, MAX_CLOUD_PERCENT, 'Fall');
+      break;
+    case 'Spring_Summer':
+      var spring = createS2Mosaic(ranges[0], aoi, MAX_CLOUD_PERCENT, 'Spring');
+      var summer = createS2Mosaic(ranges[1], aoi, MAX_CLOUD_PERCENT, 'Summer');
+      mosaic = ee.ImageCollection([spring, summer]).median();
+      //mosaic = spring.add(summer).divide(2);
+      break;
+    case 'All':
+      var springAll = createS2Mosaic(ranges[0], aoi, MAX_CLOUD_PERCENT, 'Spring');
+      var summerAll = createS2Mosaic(ranges[1], aoi, MAX_CLOUD_PERCENT, 'Summer');
+      var fallAll = createS2Mosaic(ranges[2], aoi, MAX_CLOUD_PERCENT, 'Fall');
+      mosaic = ee.ImageCollection([springAll, summerAll, fallAll]).median();
+      //mosaic = springAll.add(summerAll).add(fallAll).divide(3);
+      break;
+    default:
+      print('Unknown mode:', mode);
+      return null;
+  }
+  
+  var scaled_mosaic = mosaic.toDouble();
+  print('Final Spectral Stack:', scaled_mosaic);
+  return scaled_mosaic;
+}
+
+
+
+  
+// =======================================================================
+// 8) TRAIN / VALIDATION SPLIT & SAMPLING
+// =======================================================================
+function splitTrainValidate(fc, trainFrac){
+  var withRand = fc.randomColumn('rand', 42);
+  return {
+    train: withRand.filter(ee.Filter.lt('rand', trainFrac)),
+    valid: withRand.filter(ee.Filter.gte('rand', trainFrac))
+  };
+}
+
+function samplePixels(image, fc, scale, keepGeometries, tileScale){
+  keepGeometries = (keepGeometries === true);
+  tileScale = tileScale || 16;
+
+  return image.sampleRegions({
+    collection: fc,
+    properties: ['Class'],
+    scale: scale,
+    tileScale: tileScale,
+    geometries: keepGeometries
+  });
+}
+
+// =======================================================================
+// 9) OPTIONS
+// =======================================================================
+// Show All Images
+if (SHOW_MOSAICS_ONLY) {
+  var seasonalModes = ['Spring', 'Summer', 'Fall', 'Spring_Summer', 'All'];
+  
+    // Check if a mode was actually provided before running the compilation
+  if (MOSAIC_MODE_PRIMARY) {
+    
+    var stack = ImageryCompilation(MOSAIC_MODE_PRIMARY, processingGeometry);
+    Map.addLayer(stack, visRGB, 'Mosaic: ' + MOSAIC_MODE_PRIMARY);
+    
+    print('Displayed mosaic for mode:', MOSAIC_MODE_PRIMARY);
+    print('Random Forest processing is skipped.');
+    
+    // Export Images
+    if (EXPORT_ALL_IMAGES) {
+      var export_name = project_name  + "_" + MOSAIC_MODE_PRIMARY;
+  
+      Export.image.toDrive({
+        image: stack,
+        description: export_name,          // job name in Tasks
+        folder: "GEE_Random_Forest_" + project_name, // Drive folder
+        fileNamePrefix: export_name,       // actual GeoTIFF name
+        region: processingGeometry,
+        scale: SAMPLE_SCALE,
+        maxPixels: 1e13
+      });
+    }
+    
+    return;
+  }
+}
+
+
+// =======================================================================
+// 10) FINAL CLASSIFICATION & REDUCED-BAND MODEL
+// =======================================================================
+var overall_model_rate = ee.String('').slice(0, 6);
+var kappa_model_rate = ee.String('').slice(0, 6);
+
+var resultsDict = ee.Dictionary({
+  overall: overall_model_rate,
+  kappa: kappa_model_rate
+});
+
+function printValidationMetrics(validated, label) {
+  
+  // 1. Calculate the server-side Error Matrix (ee.ConfusionMatrix)
+  var em = validated.errorMatrix('Class', 'classification', CLASS_ORDER);
+
+  // Print the server-side objects for the GEE console
+  print(label + " matrix:", em);
+  print(label + " OA:", em.accuracy());
+  print(label + " kappa:", em.kappa());
+
+  // 2. Prepare the final, formatted strings (server-side)
+  // We use .format() to ensure a nice string result before evaluation.
+  var overallString = ee.Number(em.accuracy()).format('%.3f');
+  var kappaString = ee.Number(em.kappa()).format('%.3f');
+  
+  // 3. Create a server-side dictionary of the final strings to evaluate
+  var metricsToEvaluate = ee.Dictionary({
+    overall: overallString,
+    kappa: kappaString
+  });
+  
+  // 4. Run the evaluation and handle the client-side update
+  metricsToEvaluate.evaluate(function(result, error) {
+    if (error) {
+      // Handle any errors from the server computation
+      overallResultLabel.setValue('Model Metric: ERROR');
+      kapaResultLabel.setValue('Kappa Statistics: ERROR');
+      print('Evaluation Error:', error);
+      return;
+    }
+    
+    // Success: 'result' is a client-side JavaScript object/dictionary.
+    // Use .setValue() on the pre-existing UI Labels.
+    overallResultLabel.setValue('Model Metric: ' + result.overall);
+    kapaResultLabel.setValue('Kappa Statistics: ' + result.kappa);
+    
+    overallResultLabel.style().set('color', 'blue');
+    kapaResultLabel.style().set('color', 'blue');
+  });
+  
+  return em; // Return the server-side ConfusionMatrix object
+}
+
+
+// function classifyAndAddLayer(image_stack, classifier, label, clipGeom) {
+//   clipGeom = clipGeom || processingGeometry;
+
+//   // 1. Create a "Real Data" mask BEFORE we unmask anything.
+//   // This identifies exactly where REAL satellite data exists.
+//   var validDataMask = image_stack.mask().reduce(ee.Reducer.min());
+
+//   // 2. Classify using the unmasked stack (prevents the transparency/crash)
+//   var classified = image_stack.unmask(0).classify(classifier);
+
+//   // 3. RE-APPLY MASK: Only show pixels where data was real.
+//   // This removes the "Zero-inflated" guesses that dropped your Kappa.
+//   var cleanedClassified = classified.updateMask(validDataMask).clip(clipGeom);
+
+//   // var scaled_classified = cleanedClassified.toInt8();
+//   // print('Map scale (m/pixel at current zoom):', Map.getScale());
+//   // print('image_stack nominal scale:', image_stack.projection().nominalScale());
+//   // print('classified nominal scale:', scaled_classified.projection().nominalScale());
+//   // print('classified CRS:', scaled_classified.projection().crs());
+
+
+// //   Map.addLayer(scaled_classified, {
+// //     min: 1, // Back to 1 since we masked out the 0s
+// //     max: (typeof CLASS_COUNT !== 'undefined') ? CLASS_COUNT : 16,
+// //     palette: (typeof classPalette !== 'undefined') ? classPalette : ['#000000'], 
+// //     opacity: 1.0
+// //   }, label);
+
+// //   return scaled_classified;
+// // }
+
+// // Use a 10m S2 band projection as reference
+// // Use a 10m S2 band projection as reference
+//   var proj10 = image_stack.select('B2').projection();
+  
+//   var scaled_classified = cleanedClassified
+//     .toUint8()
+//     .reproject({crs: proj10, scale: 10});   // force 10m display
+  
+//   Map.addLayer(scaled_classified, {
+//     min: 1,
+//     max: (typeof CLASS_COUNT !== 'undefined') ? CLASS_COUNT : 16,
+//     palette: (typeof classPalette !== 'undefined') ? classPalette : ['#000000'],
+//     opacity: 1.0
+//   }, label);
+  
+//   return scaled_classified;
+
+// }
+
+
+function classifyAndAddLayer(image_stack, classifier, label, clipGeom, shown) {
+  clipGeom = clipGeom || processingGeometry;
+  shown = (shown === undefined) ? true : shown;
+
+  // mask of real data (all bands)
+  var validDataMask = image_stack.mask().reduce(ee.Reducer.min());
+
+  // classify (do NOT force reproject on the returned image)
+  var classified = image_stack.unmask(0).classify(classifier);
+  var cleaned = classified.updateMask(validDataMask).clip(clipGeom).toUint8();
+
+  // display-only reprojection (safe to do only for visualization)
+  var proj10 = image_stack.select('B2').projection();
+  var displayImg = cleaned.reproject({crs: proj10, scale: 10});
+  var proj10 = image_stack.select('B2').projection();
+  print('B2 projection:', proj10);
+  print('B2 nominal scale (m):', proj10.nominalScale());
+
+  
+  // display scale (NOT the same as native pixel size)
+  // print('Map display scale (m per screen pixel):', Map.getScale());
+
+  Map.addLayer(displayImg, {
+    min: 1,
+    max: CLASS_COUNT,
+    palette: classPalette,
+    opacity: 1.0
+  }, label, shown);
+
+  return cleaned; // <-- use THIS for export + sampling + mispoints
+}
+
+
+// =======================================================================
+// RUN FINAL RF (ONE canonical OA/Kappa + mispoints + optional map-metrics)
+// =======================================================================
+// function runFinalRF(bestParams, trainPx, split, image_stack, processingGeometry) {
+
+//   print('------------------------------------------');
+//   print('USING BEST RF PARAMS:', bestParams);
+//   print('------------------------------------------');
+
+//   // var bestClassifier = ee.Classifier.smileRandomForest(bestParams)
+//   //   .train(trainPx, 'Class');
+    
+//   var bestClassifier = ee.Classifier.smileRandomForest(bestParams).train({
+//   features: trainPx,
+//   classProperty: 'Class',
+//   inputProperties: FINAL_MODEL_BANDS });
+
+//   // Final map (your export/display product)
+//   var final_classified = classifyAndAddLayer(
+//     image_stack,
+//     bestClassifier,
+//     'RF 16-Classified (FINAL)',
+//     processingGeometry,
+//     true
+//   );
+  
+//   // print('Final classified projection:', final_classified.projection());
+//   // print('Final classified nominal scale (m):', final_classified.projection().nominalScale());
+//   // Optional smoothing (ONLY if you enable it)
+//   if (APPLY_SMOOTHING) {
+//     final_classified = final_classified
+//       .focal_mode(SMOOTHING_RADIUS_PIX, 'circle', 'pixels')
+//       .toUint8();
+
+//     Map.addLayer(final_classified, {
+//       min: 1, max: CLASS_COUNT, palette: classPalette, opacity: 1.0
+//     }, 'RF 16-Classified (FINAL + SMOOTHED)', true);
+//   }
+
+//   // -------- SINGLE validation FC WITH geometry (source of truth) --------
+//   var validPts = samplePixels(image_stack, split.valid, SAMPLE_SCALE, true, 16);
+//   print("Valid pixels USED (geom):", validPts.size());
+
+//   // ✅ ONE OA/Kappa only (canonical model validation)
+//   var validatedPts = validPts.classify(bestClassifier);
+//   printValidationMetrics(validatedPts, "Validation (MODEL)");
+
+//   // Mispoints from SAME validatedPts
+//   var IncorrectClassified = validatedPts.map(function(f) {
+//     var truth = ee.Number(f.get('Class')).toInt();
+//     var pred  = ee.Number(f.get('classification')).toInt();
+//     return f.set({
+//       truth_label: truth,
+//       pred_label: pred,
+//       isMis: truth.neq(pred).int()
+//     });
+//   }).filter(ee.Filter.eq('isMis', 1));
+
+//   print("Incorrect validation pixels:", IncorrectClassified.size());
+//   Map.addLayer(IncorrectClassified, {color: 'red'}, 'Incorrectly Classed Points', false);
+
+//   // Feature importance
+//   var importance = ee.Dictionary(bestClassifier.explain().get('importance'));
+//   sortImportanceDictionary(importance);
+
+//   // Optional: MAP/product accuracy (only meaningful if you post-process, e.g. smoothing)
+//   // Set to true ONLY if you want a product-based metric as well.
+//   var REPORT_MAP_METRICS = false;
+
+//   if (REPORT_MAP_METRICS || APPLY_SMOOTHING) {
+//     var mapPts = final_classified.rename('pred').sampleRegions({
+//       collection: validPts,
+//       properties: ['Class'],
+//       scale: 10,
+//       tileScale: 16,
+//       geometries: true
+//     }).filter(ee.Filter.notNull(['pred']));
+
+//     var emMap = mapPts.errorMatrix('Class', 'pred', CLASS_ORDER);
+//     print("Validation (MAP/product) matrix:", emMap);
+//     print("Validation (MAP/product) OA:", emMap.accuracy());
+//     print("Validation (MAP/product) Kappa:", emMap.kappa());
+//   }
+
+//   // Export the same raster you see
+//   if (EXPORT_CLASSIFIED) {
+//     var export_name = project_name + "_" + targetYear;
+
+//     Export.image.toDrive({
+//       image: final_classified,
+//       description: export_name,
+//       folder: "GEE_Random_Forest_" + project_name,
+//       fileNamePrefix: export_name,
+//       region: processingGeometry,
+//       scale: SAMPLE_SCALE,
+//       maxPixels: 1e13
+//     });
+//   }
+// }
+function runFinalRF(bestParams, trainPx, split, image_stack, processingGeometry) {
+
+  print('------------------------------------------');
+  print('USING BEST RF PARAMS:', bestParams);
+  print('------------------------------------------');
+
+  var bestClassifier = ee.Classifier.smileRandomForest(bestParams).train({
+    features: trainPx,
+    classProperty: 'Class',
+    inputProperties: FINAL_MODEL_BANDS
+  });
+
+  // Export trained model asset only if UI checkbox is enabled
+  if (EXPORT_FINAL_MODEL) {
+    if (!GEE_PROJECT_ID || GEE_PROJECT_ID === 'YOUR_GEE_PROJECT_ID') {
+      print('WARNING: Model export is enabled, but GEE_PROJECT_ID is not set correctly.');
+      print('Please update GEE_PROJECT_ID near the top of the script.');
+    } else {
+      exportSavedClassifier(bestClassifier, bestParams, FINAL_MODEL_BANDS);
+    }
+  }
+
+  // Final classified map
+  var final_classified = classifyAndAddLayer(
+    image_stack,
+    bestClassifier,
+    'RF 16-Classified (FINAL)',
+    processingGeometry,
+    true
+  );
+
+  if (APPLY_SMOOTHING) {
+    final_classified = final_classified
+      .focal_mode(SMOOTHING_RADIUS_PIX, 'circle', 'pixels')
+      .toUint8();
+
+    Map.addLayer(final_classified, {
+      min: 1, max: CLASS_COUNT, palette: classPalette, opacity: 1.0
+    }, 'RF 16-Classified (FINAL + SMOOTHED)', true);
+  }
+
+  var validPts = samplePixels(image_stack, split.valid, SAMPLE_SCALE, true, 16);
+  print("Valid pixels USED (geom):", validPts.size());
+
+  var validatedPts = validPts.classify(bestClassifier);
+  printValidationMetrics(validatedPts, "Validation (MODEL)");
+
+  var IncorrectClassified = validatedPts.map(function(f) {
+    var truth = ee.Number(f.get('Class')).toInt();
+    var pred  = ee.Number(f.get('classification')).toInt();
+    return f.set({
+      truth_label: truth,
+      pred_label: pred,
+      isMis: truth.neq(pred).int()
+    });
+  }).filter(ee.Filter.eq('isMis', 1));
+
+  print("Incorrect validation pixels:", IncorrectClassified.size());
+  Map.addLayer(IncorrectClassified, {color: 'red'}, 'Incorrectly Classed Points', false);
+
+  var importance = ee.Dictionary(bestClassifier.explain().get('importance'));
+  sortImportanceDictionary(importance);
+
+  var REPORT_MAP_METRICS = false;
+
+  if (REPORT_MAP_METRICS || APPLY_SMOOTHING) {
+    var mapPts = final_classified.rename('pred').sampleRegions({
+      collection: validPts,
+      properties: ['Class'],
+      scale: 10,
+      tileScale: 16,
+      geometries: true
+    }).filter(ee.Filter.notNull(['pred']));
+
+    var emMap = mapPts.errorMatrix('Class', 'pred', CLASS_ORDER);
+    print("Validation (MAP/product) matrix:", emMap);
+    print("Validation (MAP/product) OA:", emMap.accuracy());
+    print("Validation (MAP/product) Kappa:", emMap.kappa());
+  }
+
+  if (EXPORT_CLASSIFIED) {
+    var export_name = project_name + "_" + targetYear;
+
+    Export.image.toDrive({
+      image: final_classified,
+      description: export_name,
+      folder: "GEE_Random_Forest_" + project_name,
+      fileNamePrefix: export_name,
+      region: processingGeometry,
+      scale: SAMPLE_SCALE,
+      maxPixels: 1e13
+    });
+  }
+}
+
+
+// =======================================================================
+// TUNE RF -> pick BEST -> auto-run FINAL map + metrics
+// =======================================================================
+function tuneRandomForestAndRunFinal(grid, trainPx, validPx, split, image_stack, processingGeometry) {
+
+  // Client-side param storage (plain JS objects)
+  var paramList = [];
+
+  // Server-side metric lists (we keep as ee.Numbers in JS arrays then evaluate once)
+  var oaList = [];
+  var kappaList = [];
+
+  grid.forEach(function(p, idx) {
+    paramList.push(p);
+
+    // var clf = ee.Classifier.smileRandomForest(p).train(trainPx, 'Class');
+    var clf = ee.Classifier.smileRandomForest(p).train({
+        features: trainPx,
+        classProperty: 'Class',
+        inputProperties: FINAL_MODEL_BANDS });
+        
+    var validated = validPx.classify(clf);
+
+    var em = validated.errorMatrix('Class', 'classification', CLASS_ORDER);
+    var oa = em.accuracy();
+    var kappa = em.kappa();
+
+    // print each combo (server-side numbers print fine)
+    print('Combo', idx + 1, p, 'OA:', oa, 'Kappa:', kappa);
+
+    oaList.push(oa);
+    kappaList.push(kappa);
+  });
+
+  // Evaluate both lists once, choose best on client, then run FINAL
+  ee.Dictionary({
+    oa: ee.List(oaList),
+    kappa: ee.List(kappaList)
+  }).evaluate(function(res, err) {
+
+    if (err || !res || !res.kappa || !res.oa) {
+      print('TUNE ERROR:', err);
+      print('Try reducing grid size or increasing tileScale in samplePixels().');
+      return;
+    }
+
+    var oaArr = res.oa;       // JS number array
+    var kArr  = res.kappa;    // JS number array
+
+    var bestIndex = 0;
+    var bestK = -999;
+    var bestOA = -999;
+
+    // Max Kappa; tie-break with OA
+    for (var i = 0; i < kArr.length; i++) {
+      var k = kArr[i];
+      var oa = oaArr[i];
+
+      if (k > bestK || (k === bestK && oa > bestOA)) {
+        bestK = k;
+        bestOA = oa;
+        bestIndex = i;
+      }
+    }
+
+    var bestParams = paramList[bestIndex];
+
+    print('==========================================');
+    print('BEST INDEX (1-based):', bestIndex + 1);
+    print('BEST KAPPA:', bestK);
+    print('BEST OA:', bestOA);
+    print('BEST PARAMS:', bestParams);
+    print('==========================================');
+
+    // Auto-run final map + metrics with best params
+    runFinalRF(bestParams, trainPx, split, image_stack, processingGeometry);
+  });
+}
+
+
+// ======================================================================= 
+// Importance: 
+// Resort Function 
+function sortImportanceDictionary(impDict) {
+
+  impDict.evaluate(function(impObj) {
+    if (!impObj) {
+      print("Error: Importance dictionary is null. Cannot sort bands.");
+      return;
+    }
+
+    var entries = [];
+    for (var key in impObj) {
+      if (impObj.hasOwnProperty(key)) {
+        entries.push([key, impObj[key]]);
+      }
+    }
+    // Sort Entries
+    entries.sort(function(a, b) {
+      return b[1] - a[1];
+    });
+
+    var sortedFinalDict = {};
+    var sortedOutputList = [];
+    
+    for (var i = 0; i < entries.length; i++) {
+        var key = entries[i][0];
+        var value = entries[i][1];
+        var formattedValue = value.toFixed(4); 
+
+        sortedFinalDict[key] = value;
+        
+        var formattedEntry = (i + 1) + ". " + key + ": " + formattedValue;
+        sortedOutputList.push(formattedEntry);
+    }
+    
+    // --- Print Results ---
+    print("Sorted Features List (Rank, Name, Score):", sortedOutputList);
+
+  });
+}
+
+
+// ======================================================================
+// WorkFlow: Prepare training data, build image stack, sample pixels
+// =======================================================================
+
+// List of class IDs
+var classIds = [
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+var classes;
+
+// Mapping of class IDs to variables
+var classMap = {
+  1: Water_11,
+  2: Develop_NoStructure_20,
+  3: Develop_Open_21,
+  4: Develop_Low_22,
+  5: Develop_Medium_23,
+  6: Develop_High_24,
+  7: Barren_Land_31,
+  8: Deciduous_Forest_41,
+  9: Evergreen_Forest_42,
+  10: Mixed_Forest_43,
+  11: Shrub_52,
+  12: Grassland_71,
+  13: Pasture_81,
+  14: Cultivated_82,
+  15: Woody_Wetland_90,
+  16: Herbaceous_95
+};
+
+classes = ee.FeatureCollection(classIds.map(function(c) {
+      return classMap[c];
+    })).flatten();
+  
+    classes = clipToTrainBuffer(classes);
+
+print("Total Samples:", classes.size());
+
+
+// =======================================================================
+// Build primary image stack  ImageryCompilation
+// =======================================================================
+// var image_stack = ImageryCompilation(MOSAIC_MODE_PRIMARY, processingGeometry);
+var image_stack = ImageryCompilation(MOSAIC_MODE_PRIMARY, processingGeometry)
+  .select(FINAL_MODEL_BANDS);
+// Split & sample pixels
+var split   = splitTrainValidate(classes, 0.8);
+var trainPx = samplePixels(image_stack, split.train, SAMPLE_SCALE, false);
+var validPx = samplePixels(image_stack, split.valid, SAMPLE_SCALE, true);
+
+// print("Train pixels USED:", trainPx.size());
+// print("Valid pixels USED:", validPx.size());
+
+  
+
+// ================================================================
+// RANDOM FOREST CLASSIFIER SETUP
+// ================================================================
+var DEFAULT_RF_PARAMS = {params: null}; // Placeholder for parameters
+
+// ================================================================
+// RF: TUNE OR DEFAULT -> ALWAYS RUN FINAL MAP + METRICS
+// ================================================================
+
+// (A) Build training pixels ONCE (no geometry here)
+var trainPx = samplePixels(image_stack, split.train, SAMPLE_SCALE, false, 16);
+var validPx = samplePixels(image_stack, split.valid, SAMPLE_SCALE, true, 16);
+
+// print("Train pixels USED:", trainPx.size());
+// print("Valid pixels USED:", validPx.size());
+
+if (TUNE_MODEL) {
+
+  // --- Smaller grid (safer). Expand later if you want. ---
+  var grid = [];
+  var nTreesList = [200, 250];
+  var minLeafList = [1, 2];
+  var varsPerSplitList = [4, 6];
+  var bagFracList = [0.6];
+
+  nTreesList.forEach(function(nTrees){
+    minLeafList.forEach(function(minLeaf){
+      varsPerSplitList.forEach(function(vps){
+        bagFracList.forEach(function(bf){
+          grid.push({
+            numberOfTrees: nTrees,
+            minLeafPopulation: minLeaf,
+            variablesPerSplit: vps,
+            bagFraction: bf,
+            seed: randomSeed
+          });
+        });
+      });
+    });
+  });
+
+  print("RF Tuning Grid (" + grid.length + " combos):", grid);
+
+  // Optional limits (prevents memory blowups)
+  var trainPxTune = trainPx.limit(4000);
+  var validPxTune = validPx.limit(2000);
+
+  // Tune -> selects best -> runs final map + final metrics automatically
+  tuneRandomForestAndRunFinal(grid, trainPxTune, validPxTune, split, image_stack, processingGeometry);
+
+} else {
+
+  // Default params -> runs final map + final metrics automatically
+  var defaultParams = {
+    numberOfTrees: numberOfTrees,
+    minLeafPopulation: minLeafPopulation,
+    variablesPerSplit: variablesPerSplit,
+    bagFraction: bagFraction,
+    seed: randomSeed
+  };
+
+  runFinalRF(defaultParams, trainPx, split, image_stack, processingGeometry);
+}
+
+// =======================================================================
+// RANDOM FOREST TUNING: 8 combinations, print all results
+// =======================================================================
+function tuneRandomForestAndPrint(grid, trainPx, validPx) {
+  var best = {params: null, accuracy: -1, kappa: -1};
+  
+   // Store results client-side
+  var kappaList = [];
+  var paramList = [];
+  var indexList = [];
+  
+  grid.forEach(function(p, idx) {
+    // Train classifier
+    var clf = ee.Classifier.smileRandomForest(p).train({
+      features: trainPx,
+      classProperty: 'Class',
+      inputProperties: FINAL_MODEL_BANDS
+    });
+    
+    // Classify validation pixels
+    var validated = validPx.classify(clf);
+    
+    // Cast to int so equality check is strict
+    validated = validated.map(function(f){
+      return f.set({
+        Class: ee.Number(f.get('Class')).toInt(),
+        classification: ee.Number(f.get('classification')).toInt()
+      });
+    });
+    
+    var correctPts = validated.filter(ee.Filter.eq('Class', 'classification'));
+    var misPts     = validated.filter(ee.Filter.neq('Class', 'classification'));
+    
+    Map.addLayer(correctPts, {color: '00FF00'}, 'Validation Correct Pixels', false);
+    Map.addLayer(misPts,     {color: 'FF0000'}, 'Validation Misclassified Pixels', false);
+    
+    // Confusion matrix from the SAME validated set
+    var em = validated.errorMatrix('Class', 'classification', CLASS_ORDER);
+    printConfusionExpanded(em, 'Validation');
+    print('Per-class accuracy table:', perClassAccuracyTable(em));
+    
+    // Get OA & kappa (server-side)
+    var oa = em.accuracy();
+    var kappa = em.kappa();
+    
+    // Print combination & metrics
+    print('Combination', idx+1, p, 'OA:', oa, 'Kappa:', kappa);
+    
+     // Store for later (client side storage)
+    kappaList.push(kappa);
+    paramList.push(p);
+    indexList.push(idx);
+    
+  });
+  
+  // Now we need to evaluate all kappa values and find the best one
+// Now we need to evaluate all kappa values and find the best one
+ee.List(kappaList).evaluate(function(kappaValues) {
+
+  // --- SAFETY GUARD ---
+  if (kappaValues === undefined || kappaValues === null) {
+    print('TUNE ERROR: kappaValues is undefined/null.');
+    print('This usually means the server evaluation failed (timeout/memory).');
+    print('Check the Console for the RED error message above, then reduce grid size or limit pixels.');
+    return;
+  }
+
+  if (!Array.isArray(kappaValues) || kappaValues.length === 0) {
+    print('TUNE WARNING: kappaValues is not a normal array or is empty:', kappaValues);
+    return;
+  }
+
+  var maxKappa = -999;
+  var bestIndex = -1;
+
+  kappaValues.forEach(function(kval, i) {
+    if (kval > maxKappa) {
+      maxKappa = kval;
+      bestIndex = i;
+    }
+  });
+
+  print('------------------------------------------');
+  print('BEST KAPPA:', maxKappa);
+  print('BEST INDEX (1-based):', bestIndex + 1);
+  print('BEST PARAMS:', paramList[bestIndex]);
+  print('------------------------------------------');
+});
+}
+
+
+// End...
+}
+
+
+

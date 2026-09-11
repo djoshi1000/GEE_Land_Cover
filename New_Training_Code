@@ -1,0 +1,1157 @@
+/*************************************************************************************************
+ *  SENTINEL-2 + SENTINEL-1 RANDOM FOREST LAND-COVER PIPELINE  |  16 classes (NLCD-style)  |  v4.0
+ *
+ *  H-GAC region, Texas.  Rework of v3.5 (Durga Joshi & Juan Campos): same workflow, same classes,
+ *  same outputs; restructured for speed, reproducibility and a number of bug fixes.
+ *
+ *  REQUIREMENTS
+ *  - Training samples as geometry imports, one per class, named (the class id comes from the name):
+ *      Water_11, Develop_NoStructure_20, Develop_Open_21, Develop_Low_22, Develop_Medium_23,
+ *      Develop_High_24, Barren_Land_31, Deciduous_Forest_41, Evergreen_Forest_42, Mixed_Forest_43,
+ *      Shrub_52, Grassland_71, Pasture_81, Cultivated_82, Woody_Wetland_90, Herbaceous_95
+ *    Import them as FeatureCollections (one feature per point/polygon). A 'Class' property is
+ *    optional - it is (re)set from the variable name. Missing imports are reported, not fatal.
+ *    Alternatives (Samples section of the panel): a merged FeatureCollection asset with a 'Class'
+ *    property (1-16), or a pre-sampled pixel table exported by this script.
+ *  - GEE_PROJECT_ID / ASSET_ROOT only matter for asset exports and saved models.
+ *
+ *  TO REPRODUCE THE v3.5 COMPOSITING:  CLOUD_MASK = 'QA60'; MAX_CLOUD_PERCENT = 10;
+ *                                       ADD_SEASONAL_BANDS = false;
+ *************************************************************************************************/
+
+// ==================================================================================
+//  1. USER SETTINGS
+// ==================================================================================
+var GEE_PROJECT_ID = 'Sem_west';                       // Cloud project id shown in the Code Editor project picker
+var ASSET_ROOT     = 'projects/' + GEE_PROJECT_ID + '/assets/';   // legacy accounts: 'users/<name>/'
+var project_name   = GEE_PROJECT_ID;                   // editable in the panel
+var targetYear     = 2025;                             // editable in the panel
+var MOSAIC_MODE_PRIMARY = 'All';                       // 'All' | 'Spring' | 'Summer' | 'Fall' | 'Spring_Summer'
+var MODEL_VERSION  = 'v2';                             // v2 = fixed RVI/NDVI maths -> not interchangeable with v1 models
+
+// Grid ----------------------------------------------------------------------------------------
+var OUTPUT_CRS        = 'EPSG:32615';   // UTM 15N. Sampling, texture and export all use this one 10 m grid
+var SAMPLE_SCALE      = 10;
+var SAMPLE_TILE_SCALE = 4;              // raise to 8-16 only if you see "User memory limit exceeded"
+
+// Sentinel-2 compositing ----------------------------------------------------------------------
+var CLOUD_MASK        = 'CSPLUS';       // 'CSPLUS' = Cloud Score+ per-pixel mask (recommended) | 'QA60' = v3.5 behaviour
+var CS_PLUS_THRESHOLD = 0.60;           // keep pixels with cs_cdf >= threshold (0.50 looser ... 0.65 stricter)
+var MAX_CLOUD_PERCENT = 40;             // scene-level pre-filter; 10 = v3.5 behaviour (very few scenes on the Gulf coast)
+
+// Sentinel-1 ----------------------------------------------------------------------------------
+var S1_ORBIT_PASS = null;               // 'ASCENDING' | 'DESCENDING' | null = both (single pass gives cleaner std-dev)
+
+// Features ------------------------------------------------------------------------------------
+var ADD_SEASONAL_BANDS  = true;         // multi-season modes: add per-season NDVI and MNDWI (phenology)
+var SEASONAL_SOURCES    = ['NDVI', 'B_MNDWI'];
+var GLCM_SIZE           = 3;            // GLCM neighbourhood radius in pixels (3 -> 7x7 window)
+var NDMI_GLCM_VAR_SCALE = 500;          // GLCM variance at which the texture term of B_MOISTURE saturates
+
+// Training ------------------------------------------------------------------------------------
+var TRAIN_BUFFER_KM = 3;                // samples must fall inside TRAIN counties + this buffer
+var TRAIN_FRACTION  = 0.8;              // split is per drawn feature, so polygon pixels never leak across the split
+var MAX_TRAIN_PIXELS_PER_CLASS = null;  // e.g. 3000 caps dominant classes; null = use every pixel
+var TUNE_PIXELS_PER_CLASS      = 300;   // class-balanced subsample used by the tuner
+var randomSeed = 42;                    // used for the split, the subsamples and the forest -> repeatable runs
+
+// Output --------------------------------------------------------------------------------------
+var APPLY_SMOOTHING      = false;       // focal-mode filter on the final raster
+var SMOOTHING_RADIUS_PIX = 1;           // 1 -> 3x3
+var DISPLAY_AT_10M       = false;       // force 10 m rendering of the classified layer (exact but slow when zoomed out)
+var EXPORT_INFER_ONLY    = true;        // export clipped to INFER counties (false = INFER + training buffer)
+var EXPORT_DESTINATION   = 'Drive';     // 'Drive' | 'Asset'
+
+// Random Forest defaults (sliders in the panel) -----------------------------------------------
+var numberOfTrees = 250, minLeafPopulation = 1, variablesPerSplit = 6, bagFraction = 0.63;
+var TUNE_GRID = { numberOfTrees: [200, 250], minLeafPopulation: [1, 2], variablesPerSplit: [4, 6], bagFraction: [0.63] };
+
+// Run-time switches (set from the panel) ------------------------------------------------------
+var SAMPLE_SOURCE = 'Drawn imports';    // 'Drawn imports' | 'Geometry asset' | 'Pixel asset'
+var SAMPLE_ASSET_ID = '';
+var APPLY_MODEL_ASSET = '';             // saved classifier asset id -> skip training and just classify
+var SHOW_MOSAICS_ONLY = false, EXPORT_ALL_IMAGES = false, TUNE_MODEL = false, EXPORT_CLASSIFIED = false;
+var EXPORT_FINAL_MODEL = false, EXPORT_MODEL_METADATA = false;
+var EXPORT_SAMPLE_GEOMS = false, EXPORT_SAMPLED_PIXELS = false;
+
+
+// ==================================================================================
+//  2. FEATURE (BAND) DEFINITIONS
+// ==================================================================================
+// Default model feature set. The ORDER is kept fixed on purpose: with a fixed seed the forest
+// draws its candidate variables by position, so a stable order gives a reproducible forest.
+var DEFAULT_MODEL_BANDS = [
+  'NDVI', 'B_MNDWI', 'B_NDRE', 'B_MOISTURE', 'B_SWIR_COMBO', 'B_COMBO_VEG', 'B_SLOPE', 'B_BAEI',
+  'B2', 'B8', 'B8_GLCM_var', 'B_TWI', 'B_VH_StdDev', 'B_VV_StdDev', 'B_RVI', 'B_PASTURE_PROB'
+];
+var OPTIONAL_BANDS = ['B3', 'B4', 'B11', 'B12', 'B_NDMI', 'B_EVI2', 'B_LSWI', 'B_NBR', 'B_TCW'];
+var ALL_BAND_KEYS  = DEFAULT_MODEL_BANDS.concat(OPTIONAL_BANDS);
+
+var BAND_INFO = {
+  B2: 'blue reflectance',                    B3: 'green reflectance',
+  B4: 'red reflectance',                     B8: 'NIR reflectance',
+  B11: 'SWIR-1 reflectance',                 B12: 'SWIR-2 reflectance',
+  NDVI: 'vegetation index (B8,B4)',          B_MNDWI: 'modified NDWI, open water (B3,B11)',
+  B_NDMI: 'moisture index (B8A,B11)',        B_NDRE: 'red-edge index (B8A,B5)',
+  B_EVI2: 'two-band EVI',                    B_LSWI: 'land-surface water index (B8,B11)',
+  B_NBR: 'normalized burn ratio (B8,B12)',   B_BAEI: 'built-up area extraction index',
+  B_TCW: 'tasseled-cap wetness',             B_MOISTURE: 'NDMI + NDMI texture (water = -1)',
+  B_SWIR_COMBO: 'clay index + SWIR ratio',   B_COMBO_VEG: 'EVI2 x (LSWI + NBR) / 2',
+  B_PASTURE_PROB: 'COMBO_VEG - dryness (water = -5)',
+  B8_GLCM_var: 'NIR GLCM variance (texture)',
+  B_SLOPE: 'slope, radians (3DEP 10 m)',    B_TWI: 'topographic wetness index',
+  B_RVI: 'radar vegetation index (S1)',      B_VV_StdDev: 'S1 VV temporal std-dev (dB)',
+  B_VH_StdDev: 'S1 VH temporal std-dev (dB)'
+};
+
+// Bands produced per Sentinel-2 scene (composited by median) ...
+var S2_BANDS = ['B2', 'B3', 'B4', 'B5', 'B8', 'B8A', 'B11', 'B12'];
+var PER_IMAGE_BANDS = S2_BANDS.concat([
+  'NDVI', 'NDWI', 'B_MNDWI', 'B_NDMI', 'B_NDRE', 'B_LSWI', 'B_NBR', 'B_EVI2',
+  'B_SWIR_COMBO', 'B_BAEI', 'B_TCW', 'B_COMBO_VEG', 'B_PASTURE_PROB'
+]);
+// ... bands added once per seasonal composite ...
+var S1_BANDS = ['B_RVI', 'B_VV_StdDev', 'B_VH_StdDev'];
+// ... and once per run (static terrain): B_SLOPE, B_TWI
+
+
+// ==================================================================================
+//  3. CLASS SCHEME
+// ==================================================================================
+var CLASS_COUNT    = 16;
+var CLASS_ORDER    = ee.List.sequence(1, CLASS_COUNT);
+var CLASS_ORDER_JS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+var classPalette = [
+  '#0062a8', '#d9cfcf', '#e99d9d', '#ff0000', '#cc0000', '#990000',
+  '#f1cf24', '#85C77E', '#38814E', '#809f71', '#dad41d', '#68fd24',
+  '#FBF65D', '#CA9146', '#C8E6F8', '#64B3D5'
+];
+var classLabels = [
+  '1  Water (NLCD 11)',                      '2  Developed, Non-Structures (NLCD 20)',
+  '3  Developed, Open Space (NLCD 21)',      '4  Developed, Low Intensity (NLCD 22)',
+  '5  Developed, Medium Intensity (NLCD 23)', '6  Developed, High Intensity (NLCD 24)',
+  '7  Barren Land (NLCD 31)',                '8  Deciduous Forest (NLCD 41)',
+  '9  Evergreen Forest (NLCD 42)',           '10 Mixed Forest (NLCD 43)',
+  '11 Shrub/Scrub (NLCD 52)',                '12 Grassland/Herbaceous (NLCD 71)',
+  '13 Pasture/Hay (NLCD 81)',                '14 Cultivated Crops (NLCD 82)',
+  '15 Woody Wetlands (NLCD 90)',             '16 Herbaceous Wetlands (NLCD 95)'
+];
+
+// Import variables in class order 1..16. Wrapped in functions so a missing import is reported
+// instead of crashing the script.
+var CLASS_IMPORT_NAMES = [
+  'Water_11', 'Develop_NoStructure_20', 'Develop_Open_21', 'Develop_Low_22', 'Develop_Medium_23',
+  'Develop_High_24', 'Barren_Land_31', 'Deciduous_Forest_41', 'Evergreen_Forest_42', 'Mixed_Forest_43',
+  'Shrub_52', 'Grassland_71', 'Pasture_81', 'Cultivated_82', 'Woody_Wetland_90', 'Herbaceous_95'
+];
+var CLASS_IMPORTS = [
+  function () { return Water_11; },            function () { return Develop_NoStructure_20; },
+  function () { return Develop_Open_21; },     function () { return Develop_Low_22; },
+  function () { return Develop_Medium_23; },   function () { return Develop_High_24; },
+  function () { return Barren_Land_31; },      function () { return Deciduous_Forest_41; },
+  function () { return Evergreen_Forest_42; }, function () { return Mixed_Forest_43; },
+  function () { return Shrub_52; },            function () { return Grassland_71; },
+  function () { return Pasture_81; },          function () { return Cultivated_82; },
+  function () { return Woody_Wetland_90; },    function () { return Herbaceous_95; }
+];
+function getClassImport(i) { try { return CLASS_IMPORTS[i](); } catch (e) { return null; } }
+
+
+// ==================================================================================
+//  4. SMALL HELPERS
+// ==================================================================================
+var EPS = 1e-4;
+var VIS_RGB = { bands: ['B4', 'B3', 'B2'], min: 0.02, max: 0.30 };
+
+function safeAssetName(txt) { return String(txt).replace(/[^A-Za-z0-9_]+/g, '_'); }
+function runTag() { return safeAssetName(project_name) + '_' + targetYear + '_' + safeAssetName(MOSAIC_MODE_PRIMARY); }
+function driveFolder() { return 'GEE_Random_Forest_' + safeAssetName(project_name); }
+function fmt(x, d) { return (typeof x === 'number' && isFinite(x)) ? x.toFixed(d === undefined ? 3 : d) : 'n/a'; }
+
+// Multi-band, fully masked zero image with the given band names (safe fallback for empty collections)
+function emptyImage(bandNames) {
+  return ee.Image.constant(bandNames.map(function () { return 0; })).rename(bandNames).selfMask();
+}
+
+var SEASONS_FOR_MODE = {
+  All: ['Spring', 'Summer', 'Fall'], Spring_Summer: ['Spring', 'Summer'],
+  Spring: ['Spring'], Summer: ['Summer'], Fall: ['Fall']
+};
+function seasonRanges(year) {
+  var d = function (y, m) { return ee.Date.fromYMD(y, m, 1); };
+  return {
+    Spring: ee.DateRange(d(year, 1), d(year, 5)),      // Jan 1 - Apr 30
+    Summer: ee.DateRange(d(year, 5), d(year, 9)),      // May 1 - Aug 31
+    Fall:   ee.DateRange(d(year, 9), d(year + 1, 1))   // Sep 1 - Dec 31
+  };
+}
+
+// Model bands = checked bands (fixed order) + seasonal bands when the mode has more than one season
+function getModelBands() {
+  var bands = ALL_BAND_KEYS.filter(function (b) { return bandChecks[b].getValue(); });
+  var seasons = SEASONS_FOR_MODE[MOSAIC_MODE_PRIMARY];
+  if (ADD_SEASONAL_BANDS && seasons.length > 1) {
+    seasons.forEach(function (s) {
+      SEASONAL_SOURCES.forEach(function (b) { bands.push(b + '_' + s); });
+    });
+  }
+  return bands;
+}
+
+// Layers added by a run are tracked so the next run can remove them instead of piling up
+var runLayers = [];
+function addRunLayer(obj, vis, name, shown) {
+  var layer = Map.addLayer(obj, vis, name, shown);
+  runLayers.push(layer);
+  return layer;
+}
+function clearRunLayers() {
+  runLayers.forEach(function (l) { Map.layers().remove(l); });
+  runLayers = [];
+}
+
+
+// ==================================================================================
+//  5. COUNTIES
+// ==================================================================================
+var TIGER      = ee.FeatureCollection('TIGER/2018/Counties');
+var STATE_FIPS = '48';
+var COUNTY_FIPS = {
+  'Austin County': '015',    'Brazoria County': '039',  'Chambers County': '071',
+  'Colorado County': '089',  'Fort Bend County': '157', 'Galveston County': '167',
+  'Harris County': '201',    'Liberty County': '291',   'Matagorda County': '321',
+  'Montgomery County': '339', 'Walker County': '471',   'Waller County': '473',
+  'Wharton County': '481'
+};
+var TRAIN_SELECTED_COUNTIES = [];   // 3-digit FIPS, filled by the panel
+var INFER_SELECTED_COUNTIES = [];
+
+function countiesFC(fips3List) {
+  var geoids = fips3List.map(function (f) { return STATE_FIPS + f; });
+  return TIGER.filter(ee.Filter.inList('GEOID', geoids));
+}
+
+
+// ==================================================================================
+//  6. IMAGE PIPELINE
+// ==================================================================================
+var S2      = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var CS_PLUS = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var S1      = ee.ImageCollection('COPERNICUS/S1_GRD');
+
+// --- cloud masking -----------------------------------------------------------------------
+function maskQA60(img) {
+  var qa = img.select('QA60');
+  return img.updateMask(qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0)));
+}
+function maskCloudScorePlus(img) {
+  return img.updateMask(img.select('cs_cdf').gte(CS_PLUS_THRESHOLD));
+}
+function s2Collection(range, aoi) {
+  var col = S2.filterDate(range).filterBounds(aoi)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', MAX_CLOUD_PERCENT));
+  return (CLOUD_MASK === 'CSPLUS')
+    ? col.linkCollection(CS_PLUS, ['cs_cdf']).map(maskCloudScorePlus)
+    : col.map(maskQA60);
+}
+
+// --- per-scene bands (cheap, purely spectral; everything expensive happens on the composite) --
+function perImageBands(img) {
+  var s  = img.select(S2_BANDS).divide(10000).toFloat();
+  var b2 = s.select('B2'), b3 = s.select('B3'), b4 = s.select('B4'),
+      b8 = s.select('B8'), b11 = s.select('B11'), b12 = s.select('B12');
+
+  var ndvi  = s.normalizedDifference(['B8', 'B4']).rename('NDVI');      // (NIR-Red)/(NIR+Red)
+  var ndwi  = s.normalizedDifference(['B3', 'B8']).rename('NDWI');      // internal water test
+  var mndwi = s.normalizedDifference(['B3', 'B11']).rename('B_MNDWI');
+  var ndmi  = s.normalizedDifference(['B8A', 'B11']).rename('B_NDMI');
+  var ndre  = s.normalizedDifference(['B8A', 'B5']).rename('B_NDRE');
+  var lswi  = s.normalizedDifference(['B8', 'B11']).rename('B_LSWI');
+  var nbr   = s.normalizedDifference(['B8', 'B12']).rename('B_NBR');
+  var evi2  = s.expression('2.5 * (NIR - RED) / (NIR + 2.4 * RED + 1.0)', {NIR: b8, RED: b4}).rename('B_EVI2');
+
+  var swirCombo = s.expression('((NIR + SWIR1) / (SWIR2 + eps) + SWIR1 / (SWIR2 + eps)) / 2',
+    {NIR: b8, SWIR1: b11, SWIR2: b12, eps: EPS}).rename('B_SWIR_COMBO');
+
+  var baei = s.expression('(RED + 0.3) / (GREEN + SWIR1 + eps)', {RED: b4, GREEN: b3, SWIR1: b11, eps: EPS})
+    .where(ndwi.gt(0), 0).min(2).rename('B_BAEI');
+
+  var tcw = s.expression('0.1509*B2 + 0.1973*B3 + 0.3283*B4 + 0.3407*B8 - 0.7117*B11 - 0.4559*B12',
+    {B2: b2, B3: b3, B4: b4, B8: b8, B11: b11, B12: b12}).rename('B_TCW');
+
+  var dryness = s.expression('((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE) + eps)',
+    {SWIR1: b11, RED: b4, NIR: b8, BLUE: b2, eps: EPS});
+  var comboVeg = evi2.multiply(lswi.add(nbr)).divide(2).rename('B_COMBO_VEG');
+  var pasture  = comboVeg.subtract(dryness).where(ndwi.gt(0.1), -5).rename('B_PASTURE_PROB');
+  // NOTE: no unmask() here - cloud-masked pixels must stay masked so the median ignores them.
+
+  return s.addBands([ndvi, ndwi, mndwi, ndmi, ndre, lswi, nbr, evi2, swirCombo, baei, tcw, comboVeg, pasture]);
+}
+
+// --- texture on the composite (once per season instead of once per scene) ------------------
+function glcmVariance(img, name) {
+  var gray = img.unmask(0).clamp(0, 255).round().toUint8().rename(name);
+  return gray.glcmTexture({size: GLCM_SIZE}).select(name + '_var').rename(name + '_GLCM_var');
+}
+
+// --- Sentinel-1 statistics for a season (once per season instead of once per S2 scene) -------
+function s1Features(range, aoi) {
+  var col = S1.filterDate(range).filterBounds(aoi)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq('resolution_meters', 10))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .select(['VV', 'VH']);
+  if (S1_ORBIT_PASS) col = col.filter(ee.Filter.eq('orbitProperties_pass', S1_ORBIT_PASS));
+
+  var features = ee.Image(ee.Algorithms.If(
+    col.size().gt(0),
+    (function () {
+      var meanDb = col.mean();
+      var vv = ee.Image(10).pow(meanDb.select('VV').divide(10));   // dB -> linear power (10^(dB/10))
+      var vh = ee.Image(10).pow(meanDb.select('VH').divide(10));
+      var rvi = vh.multiply(4).divide(vv.add(vh).add(EPS)).rename('B_RVI');   // 4*VH/(VV+VH), ~0..2
+      var sd  = col.reduce(ee.Reducer.stdDev()).rename(['B_VV_StdDev', 'B_VH_StdDev']);
+      return rvi.addBands(sd);
+    })(),
+    emptyImage(S1_BANDS)
+  ));
+  return features.select(S1_BANDS).unmask(0).toFloat();
+}
+
+// --- static terrain features ---------------------------------------------------------------
+// USGS 3DEP slope + HydroSHEDS-based wetness proxy.
+//
+// IMPORTANT:
+// ImageCollection.mosaic() loses the useful native DEM projection unless
+// we explicitly restore it. Terrain calculations must be performed at the
+// native DEM resolution, NOT at the default 1-degree mosaic projection.
+function terrainFeatures(aoi) {
+
+  // Buffer gives slope/focal operations plenty of pixels around AOI edges.
+  var terrainAOI = aoi.buffer(2000);
+
+  // -------------------------------------------------------------------------
+  // USGS 3DEP 10 m DEM
+  // -------------------------------------------------------------------------
+  var demCol = ee.ImageCollection('USGS/3DEP/10m_collection')
+    .filterBounds(terrainAOI)
+    .select('elevation');
+
+  // Grab the native projection BEFORE mosaicking.
+  var demProjection = ee.Image(demCol.first())
+    .select('elevation')
+    .projection();
+
+  // Mosaic first, then explicitly restore the native DEM projection.
+  //
+  // DO NOT clip here. Slope needs neighboring DEM pixels.
+  var dem = demCol
+    .mosaic()
+    .setDefaultProjection(demProjection);
+
+  // -------------------------------------------------------------------------
+  // SLOPE
+  // -------------------------------------------------------------------------
+  var slopeDeg = ee.Terrain.slope(dem);
+
+  var slopeRad = slopeDeg
+    .multiply(Math.PI / 180.0)
+    .focalMean({
+      radius: 30,
+      kernelType: 'circle',
+      units: 'meters'
+    })
+    .rename('B_SLOPE')
+    .toFloat();
+
+  // -------------------------------------------------------------------------
+  // HydroSHEDS flow accumulation
+  // -------------------------------------------------------------------------
+  var flowAcc = ee.Image('WWF/HydroSHEDS/15ACC')
+    .select('b1')
+    .toFloat()
+    .resample('bilinear');
+
+  // -------------------------------------------------------------------------
+  // Wetness proxy
+  //
+  // Keep current formulation for consistency with your previous model.
+  // EPS protects flat terrain from divide-by-zero.
+  // -------------------------------------------------------------------------
+  var twi = flowAcc
+    .divide(slopeRad.max(0.001))
+    .add(1)
+    .log()
+    .focalMean({
+      radius: 60,
+      kernelType: 'circle',
+      units: 'meters'
+    })
+    .rename('B_TWI')
+    .toFloat();
+
+  // Clip ONLY AFTER slope/TWI have been calculated.
+  return slopeRad
+    .addBands(twi)
+    .clip(aoi);
+}
+
+// --- one seasonal composite with all composite-level features -------------------------------
+function seasonFeatures(range, aoi) {
+  var col = s2Collection(range, aoi).map(perImageBands);
+  var med = ee.Image(ee.Algorithms.If(col.size().gt(0), col.median(), emptyImage(PER_IMAGE_BANDS)))
+    .select(PER_IMAGE_BANDS);
+
+  var ndmi     = med.select('B_NDMI');
+  var water    = med.select('NDWI').gt(0);
+  var ndmiTex  = glcmVariance(ndmi.add(1).multiply(127.5), 'B_NDMI')    // NDMI -1..1 -> 0..255 grey levels
+    .divide(NDMI_GLCM_VAR_SCALE).clamp(0, 1);
+  var moisture = ndmi.add(ndmiTex).divide(2).where(water, -1).rename('B_MOISTURE');
+  var b8Tex    = glcmVariance(med.select('B8').multiply(255), 'B8');    // -> 'B8_GLCM_var'
+
+  return med.addBands([moisture, b8Tex, s1Features(range, aoi)]);
+}
+
+// --- full feature stack for a season mode ---------------------------------------------------
+function buildStack(mode, aoi, year) {
+  var ranges  = seasonRanges(year);
+  var seasons = SEASONS_FOR_MODE[mode];
+
+  var comps = seasons.map(function (s) {
+    return seasonFeatures(ranges[s], aoi);
+  });
+
+  var base = (comps.length === 1)
+    ? comps[0]
+    : ee.ImageCollection(comps).median();
+
+  // Build terrain specifically for this processing AOI.
+  var stack = base.addBands(terrainFeatures(aoi));
+
+  if (ADD_SEASONAL_BANDS && comps.length > 1) {
+    seasons.forEach(function (s, i) {
+      var names = SEASONAL_SOURCES.map(function (b) {
+        return b + '_' + s;
+      });
+
+      stack = stack.addBands(
+        comps[i].select(SEASONAL_SOURCES, names)
+      );
+    });
+  }
+
+  return stack.toFloat();
+}
+
+
+// ==================================================================================
+//  7. SAMPLES
+// ==================================================================================
+// Any import (FeatureCollection, Feature or Geometry) -> FeatureCollection with 'Class' set.
+// Multi-geometries are exploded so the train/validation split works per point/polygon.
+function toClassFC(x, classId) {
+  var fc = (x instanceof ee.Geometry)
+    ? ee.FeatureCollection(x.geometries().map(function (g) { return ee.Feature(ee.Geometry(g)); }))
+    : ee.FeatureCollection(x);
+  return fc.map(function (f) { return f.set('Class', classId); });
+}
+
+function gatherSampleGeometries() {
+  if (SAMPLE_SOURCE === 'Geometry asset') {
+    return ee.FeatureCollection(SAMPLE_ASSET_ID)
+      .map(function (f) { return f.set('Class', ee.Number(f.get('Class')).toInt()); });
+  }
+  var parts = [], missing = [];
+  CLASS_IMPORT_NAMES.forEach(function (name, i) {
+    var imp = getClassImport(i);
+    if (imp === null || imp === undefined) { missing.push(name); return; }
+    parts.push(toClassFC(imp, i + 1));
+  });
+  if (missing.length) {
+    print('WARNING: no import found for ' + missing.join(', ') + ' - these classes will have no samples.');
+  }
+  return parts.length ? ee.FeatureCollection(parts).flatten() : null;
+}
+
+function samplePixels(stack, fc, bands, keepGeometries, props) {
+  var img = bands ? stack.select(bands) : stack;
+  return img.sampleRegions({
+    collection: fc, properties: props, scale: SAMPLE_SCALE, projection: OUTPUT_CRS,
+    tileScale: SAMPLE_TILE_SCALE, geometries: keepGeometries
+  });
+}
+
+// Random, seeded cap of pixels per class (rare classes keep everything)
+function capPerClass(fc, cap, seed) {
+  if (!cap) return fc;
+  var withRand = fc.randomColumn('capRand', seed);
+  var parts = [];
+  for (var c = 1; c <= CLASS_COUNT; c++) {
+    parts.push(withRand.filter(ee.Filter.eq('Class', c)).limit(cap, 'capRand'));
+  }
+  return ee.FeatureCollection(parts).flatten();
+}
+
+
+// ==================================================================================
+//  8. RANDOM FOREST: train, evaluate (one request), tune, classify, export
+// ==================================================================================
+function trainRF(params, trainPx, bands) {
+  return ee.Classifier.smileRandomForest(params)
+    .train({features: trainPx, classProperty: 'Class', inputProperties: bands});
+}
+
+function classifyStack(stack, clf, bands) {
+  return stack.select(bands).classify(clf).toUint8().rename('classification');
+}
+
+function addClassifiedLayer(img, label, shown) {
+  var display = DISPLAY_AT_10M ? img.reproject({crs: OUTPUT_CRS, scale: SAMPLE_SCALE}) : img;
+  addRunLayer(display, {min: 1, max: CLASS_COUNT, palette: classPalette}, label, shown);
+}
+
+// Everything we want to know about a model, assembled server-side and fetched in ONE request
+function metricsDictionary(clf, trainPx, validPx) {
+  var em = validPx.classify(clf).errorMatrix('Class', 'classification', CLASS_ORDER);
+  var explained = ee.Dictionary(clf.explain());
+  return ee.Dictionary({
+    nTrain:        trainPx ? trainPx.size() : -1,
+    nValid:        validPx.size(),
+    trainPerClass: trainPx ? trainPx.aggregate_histogram('Class') : ee.Dictionary({}),
+    validPerClass: validPx.aggregate_histogram('Class'),
+    matrix:        em.array(),
+    oa:            em.accuracy(),
+    kappa:         em.kappa(),
+    producers:     em.producersAccuracy().project([0]).toList(),
+    consumers:     em.consumersAccuracy().project([1]).toList(),
+    oob:           explained.get('outOfBagErrorEstimate', -1),
+    importance:    explained.get('importance', ee.Dictionary({}))
+  });
+}
+
+function reportMetrics(res, label) {
+  var pad = function (v, n) { v = String(v); while (v.length < n) v = ' ' + v; return v; };
+
+  print(label + ': ' + res.nValid + ' validation pixels' +
+        (res.nTrain >= 0 ? ', ' + res.nTrain + ' training pixels' : ''));
+  print(label + ': Overall accuracy ' + fmt(res.oa) + '  |  Kappa ' + fmt(res.kappa) +
+        (res.oob >= 0 ? '  |  RF out-of-bag error ' + fmt(res.oob) : ''));
+
+  var header = pad('ref\\pred', 9) + CLASS_ORDER_JS.map(function (c) { return pad(c, 5); }).join('');
+  var rows = res.matrix.map(function (row, i) {
+    return pad(i + 1, 9) + row.map(function (v) { return pad(v, 5); }).join('');
+  });
+  print(label + ': confusion matrix (rows = reference, columns = predicted)', [header].concat(rows));
+
+  var perClass = classLabels.map(function (lbl, i) {
+    var c = String(i + 1);
+    return lbl + '  |  PA ' + fmt(res.producers[i]) + '  |  UA ' + fmt(res.consumers[i]) +
+           '  |  train n=' + (res.trainPerClass[c] || 0) + '  |  valid n=' + (res.validPerClass[c] || 0);
+  });
+  print(label + ": per-class accuracy (PA = producer's, UA = user's)", perClass);
+
+  var imp = Object.keys(res.importance)
+    .map(function (k) { return [k, res.importance[k]]; })
+    .sort(function (a, b) { return b[1] - a[1]; });
+  print(label + ': feature importance (ranked)',
+        imp.map(function (e, i) { return (i + 1) + '. ' + e[0] + ': ' + fmt(e[1], 4); }));
+
+  overallResultLabel.setValue('Overall accuracy: ' + fmt(res.oa));
+  overallResultLabel.style().set('color', 'blue');
+  kappaResultLabel.setValue('Kappa: ' + fmt(res.kappa));
+  kappaResultLabel.style().set('color', 'blue');
+}
+
+function exportClassified(img, ctx) {
+  var region = EXPORT_INFER_ONLY ? ctx.inferAOI : ctx.processingAOI;
+  var name   = runTag() + '_RF16' + (APPLY_SMOOTHING ? '_smoothed' : '');
+  var out    = img.clip(region);
+  if (EXPORT_DESTINATION === 'Asset') {
+    Export.image.toAsset({
+      image: out, description: name, assetId: ASSET_ROOT + name, region: region,
+      scale: SAMPLE_SCALE, crs: OUTPUT_CRS, maxPixels: 1e13, pyramidingPolicy: {'.default': 'mode'}
+    });
+  } else {
+    Export.image.toDrive({
+      image: out, description: name, folder: driveFolder(), fileNamePrefix: name, region: region,
+      scale: SAMPLE_SCALE, crs: OUTPUT_CRS, maxPixels: 1e13,
+      formatOptions: {cloudOptimized: true, noData: 0}
+    });
+  }
+  print('Export task created: ' + name + ' -> ' + EXPORT_DESTINATION + ' (start it in the Tasks tab).');
+}
+
+function exportClassifier(clf, params, bands) {
+  var name = 'RF_model_' + runTag() + '_' + MODEL_VERSION;
+  Export.classifier.toAsset({classifier: clf, description: name, assetId: ASSET_ROOT + name});
+  print('Model export task created: ' + ASSET_ROOT + name);
+  if (EXPORT_MODEL_METADATA) {
+    var meta = ee.FeatureCollection([ee.Feature(null, {
+      model_asset_id: ASSET_ROOT + name, project_name: project_name, target_year: targetYear,
+      mosaic_mode: MOSAIC_MODE_PRIMARY, model_version: MODEL_VERSION,
+      band_list_json: JSON.stringify(bands), rf_params_json: JSON.stringify(params),
+      output_crs: OUTPUT_CRS, sample_scale: SAMPLE_SCALE, cloud_mask: CLOUD_MASK,
+      cloud_percent: MAX_CLOUD_PERCENT, cs_plus_threshold: CS_PLUS_THRESHOLD,
+      seasonal_bands: ADD_SEASONAL_BANDS, smoothing_applied: APPLY_SMOOTHING,
+      smoothing_radius_pix: SMOOTHING_RADIUS_PIX
+    })]);
+    Export.table.toDrive({collection: meta, description: name + '_META', folder: driveFolder(),
+                          fileNamePrefix: name + '_META', fileFormat: 'CSV'});
+  }
+}
+
+// --- final model: map + metrics + lazy mis-classified layer + exports -----------------------
+function runFinal(params, trainPx, validPx, stack, bands, ctx) {
+  print('Final Random Forest parameters:', params);
+  var clf = trainRF(params, trainPx, bands);
+
+  var classified = classifyStack(stack, clf, bands);
+  if (APPLY_SMOOTHING) {
+    classified = classified.focal_mode(SMOOTHING_RADIUS_PIX, 'circle', 'pixels').toUint8();
+  }
+  addClassifiedLayer(classified.clip(ctx.processingAOI),
+    'RF 16-class ' + targetYear + (APPLY_SMOOTHING ? ' (smoothed)' : ''), true);
+
+  metricsDictionary(clf, trainPx, validPx).evaluate(function (res, err) {
+    if (err || !res) {
+      print('Metrics failed:', err);
+      overallResultLabel.setValue('Overall accuracy: ERROR');
+      return;
+    }
+    reportMetrics(res, 'Validation');
+  });
+
+  // Only computed if you switch the layer on
+  var misclassified = validPx.classify(clf).map(function (f) {
+    return f.set('isMis', ee.Number(f.get('Class')).toInt().neq(ee.Number(f.get('classification')).toInt()));
+  }).filter(ee.Filter.eq('isMis', 1));
+  addRunLayer(misclassified, {color: 'red'}, 'Misclassified validation pixels (toggle on to compute)', false);
+
+  if (EXPORT_FINAL_MODEL) exportClassifier(clf, params, bands);
+  if (EXPORT_CLASSIFIED)  exportClassified(classified, ctx);
+}
+
+// --- tuner: whole grid scored in ONE request on a class-balanced subsample -------------------
+function tuneAndRunFinal(trainPx, validPx, stack, bands, ctx) {
+  var grid = [];
+  TUNE_GRID.numberOfTrees.forEach(function (t) {
+    TUNE_GRID.minLeafPopulation.forEach(function (l) {
+      TUNE_GRID.variablesPerSplit.forEach(function (v) {
+        TUNE_GRID.bagFraction.forEach(function (b) {
+          grid.push({numberOfTrees: t, minLeafPopulation: l, variablesPerSplit: v, bagFraction: b, seed: randomSeed});
+        });
+      });
+    });
+  });
+  print('Tuning ' + grid.length + ' parameter combinations on a class-balanced subsample (max ' +
+        TUNE_PIXELS_PER_CLASS + ' training pixels per class)...');
+
+  var tuneTrain = capPerClass(trainPx, TUNE_PIXELS_PER_CLASS, randomSeed + 1);
+  var scores = grid.map(function (p) {
+    var em = validPx.classify(trainRF(p, tuneTrain, bands)).errorMatrix('Class', 'classification', CLASS_ORDER);
+    return ee.Dictionary({oa: em.accuracy(), kappa: em.kappa()});
+  });
+
+  ee.List(scores).evaluate(function (res, err) {
+    if (err || !res) {
+      print('Tuning failed:', err, '- reduce TUNE_PIXELS_PER_CLASS or the grid, or raise SAMPLE_TILE_SCALE.');
+      return;
+    }
+    var best = 0;
+    res.forEach(function (r, i) {
+      print('Combo ' + (i + 1) + ': ' + JSON.stringify(grid[i]) + '   OA ' + fmt(r.oa) + '   Kappa ' + fmt(r.kappa));
+      if (r.kappa > res[best].kappa || (r.kappa === res[best].kappa && r.oa > res[best].oa)) best = i;
+    });
+    print('Best combination: #' + (best + 1), grid[best]);
+    runFinal(grid[best], trainPx, validPx, stack, bands, ctx);
+  });
+}
+
+// --- apply a saved classifier asset (no training) -------------------------------------------
+function applySavedModel(assetId, validPx, stack, ctx) {
+  var clf   = ee.Classifier.load(assetId);
+  var bands = clf.schema();
+  print('Applying saved model ' + assetId + '. Its input bands:', bands);
+
+  var classified = classifyStack(stack, clf, bands);
+  if (APPLY_SMOOTHING) {
+    classified = classified.focal_mode(SMOOTHING_RADIUS_PIX, 'circle', 'pixels').toUint8();
+  }
+  addClassifiedLayer(classified.clip(ctx.processingAOI), 'RF 16-class ' + targetYear + ' (saved model)', true);
+
+  metricsDictionary(clf, null, validPx).evaluate(function (res, err) {
+    if (err || !res) {
+      print('Validation of the saved model failed. Do the current settings produce every band the model ' +
+            'needs, and are there samples inside the TRAIN counties?', err);
+      return;
+    }
+    reportMetrics(res, 'Saved model on current validation samples');
+  });
+  if (EXPORT_CLASSIFIED) exportClassified(classified, ctx);
+}
+
+
+// ==================================================================================
+//  9. MAIN
+// ==================================================================================
+function run_ml_model() {
+  clearRunLayers();
+  var bands = getModelBands();
+
+  // Geometries -------------------------------------------------------------------------------
+  var inferFC       = countiesFC(INFER_SELECTED_COUNTIES);
+  var trainFC       = countiesFC(TRAIN_SELECTED_COUNTIES);
+  var inferAOI      = inferFC.geometry().dissolve(1);
+  var trainBuffer   = trainFC.geometry().dissolve(1).buffer(TRAIN_BUFFER_KM * 1000);
+  var processingAOI = inferAOI.union(trainBuffer, 1);
+  var ctx = {inferAOI: inferAOI, trainBuffer: trainBuffer, processingAOI: processingAOI};
+
+  addRunLayer(inferFC.style({color: '000000', fillColor: '00000000', width: 2}), {}, 'INFER counties', true);
+  addRunLayer(trainFC.style({color: '00AAFF', fillColor: '00000000', width: 2}), {}, 'TRAIN counties', false);
+  addRunLayer(ee.FeatureCollection(trainBuffer).style({color: '00FF00', fillColor: '00FF0040', width: 2}), {},
+              'Training buffer (' + TRAIN_BUFFER_KM + ' km)', false);
+  Map.centerObject(inferAOI, 9);
+
+  print('Run settings:', {
+    project: project_name, year: targetYear, mode: MOSAIC_MODE_PRIMARY, crs: OUTPUT_CRS,
+    cloudMask: CLOUD_MASK, maxSceneCloudPct: MAX_CLOUD_PERCENT, seasonalBands: ADD_SEASONAL_BANDS,
+    sampleSource: SAMPLE_SOURCE, trainCounties: TRAIN_SELECTED_COUNTIES, inferCounties: INFER_SELECTED_COUNTIES
+  });
+
+  // Imagery ----------------------------------------------------------------------------------
+  var ranges = seasonRanges(targetYear);
+  addRunLayer(s2Collection(ranges.Summer, processingAOI).select(['B4', 'B3', 'B2']).median()
+                .divide(10000).clip(processingAOI), VIS_RGB, 'Sentinel-2 summer RGB ' + targetYear, true);
+
+  var stack = buildStack(MOSAIC_MODE_PRIMARY, processingAOI, targetYear);
+  print('Model bands (' + bands.length + '):', bands);
+
+  if (SHOW_MOSAICS_ONLY) {
+    addRunLayer(stack.clip(processingAOI), VIS_RGB, 'Mosaic: ' + MOSAIC_MODE_PRIMARY + ' ' + targetYear, true);
+    if (EXPORT_ALL_IMAGES) {
+      var stackName = runTag() + '_stack';
+      Export.image.toDrive({
+        image: stack.select(bands).clip(processingAOI), description: stackName, folder: driveFolder(),
+        fileNamePrefix: stackName, region: processingAOI, scale: SAMPLE_SCALE, crs: OUTPUT_CRS, maxPixels: 1e13
+      });
+      print('Export task created: ' + stackName);
+    }
+    print('Mosaic displayed; Random Forest skipped.');
+    return;
+  }
+
+  // Samples ----------------------------------------------------------------------------------
+  var trainPx, validPx;
+  
+  if (SAMPLE_SOURCE === 'Pixel asset') {
+  
+    var px = ee.FeatureCollection(SAMPLE_ASSET_ID)
+      .map(function (f) {
+        return f.set(
+          'Class',
+          ee.Number(f.get('Class')).toInt()
+        );
+      });
+  
+    trainPx = px.filter(
+      ee.Filter.lt('rand', TRAIN_FRACTION)
+    );
+  
+    validPx = px.filter(
+      ee.Filter.gte('rand', TRAIN_FRACTION)
+    );
+  
+    print(
+      'Using pre-sampled pixels from ' +
+      SAMPLE_ASSET_ID +
+      ' (image sampling skipped).'
+    );
+  
+  } else {
+  
+    var samples = gatherSampleGeometries();
+  
+    if (!samples) {
+      print(
+        'ERROR: no sample geometries found - nothing to train on.'
+      );
+      return;
+    }
+  
+    samples = samples
+      .filterBounds(trainBuffer)
+      .randomColumn('rand', randomSeed);
+  
+    var trainGeoms = samples.filter(
+      ee.Filter.lt('rand', TRAIN_FRACTION)
+    );
+  
+    var validGeoms = samples.filter(
+      ee.Filter.gte('rand', TRAIN_FRACTION)
+    );
+  
+    trainPx = samplePixels(
+      stack,
+      trainGeoms,
+      bands,
+      false,
+      ['Class']
+    );
+  
+    validPx = samplePixels(
+      stack,
+      validGeoms,
+      bands,
+      true,
+      ['Class']
+    );
+  
+    if (EXPORT_SAMPLE_GEOMS) {
+  
+      var geomName =
+        'RF_samples_geom_' +
+        safeAssetName(project_name);
+  
+      Export.table.toAsset({
+        collection: samples.select(['Class', 'rand']),
+        description: geomName,
+        assetId: ASSET_ROOT + geomName
+      });
+  
+      print(
+        'Sample-geometry export task created: ' +
+        ASSET_ROOT +
+        geomName +
+        '  (then choose "Geometry asset" as sample source).'
+      );
+    }
+  
+    if (EXPORT_SAMPLED_PIXELS) {
+  
+      var pxName =
+        'RF_samples_px_' +
+        runTag();
+  
+      Export.table.toAsset({
+        collection: samplePixels(
+          stack,
+          samples,
+          null,
+          true,
+          ['Class', 'rand']
+        ),
+        description: pxName,
+        assetId: ASSET_ROOT + pxName
+      });
+  
+      print(
+        'Sampled-pixel export task created: ' +
+        ASSET_ROOT +
+        pxName +
+        '  (then choose "Pixel asset" as sample source for fast re-runs / tuning).'
+      );
+    }
+  }
+  
+  trainPx = capPerClass(
+    trainPx,
+    MAX_TRAIN_PIXELS_PER_CLASS,
+    randomSeed
+  );
+
+  // Model ------------------------------------------------------------------------------------
+  if (APPLY_MODEL_ASSET) { applySavedModel(APPLY_MODEL_ASSET, validPx, stack, ctx); return; }
+  if (TUNE_MODEL) {
+    tuneAndRunFinal(trainPx, validPx, stack, bands, ctx);
+  } else {
+    runFinal({numberOfTrees: numberOfTrees, minLeafPopulation: minLeafPopulation,
+              variablesPerSplit: variablesPerSplit, bagFraction: bagFraction, seed: randomSeed},
+             trainPx, validPx, stack, bands, ctx);
+  }
+}
+
+
+// ==================================================================================
+// 10. REFERENCE LAYERS (loaded once, hidden by default)
+// ==================================================================================
+var NLCD_REFERENCE_YEAR = 2023;
+var NLCD_TO_16 = {   // NLCD code -> this scheme (12 ice/snow dropped; class 2 has no NLCD equivalent)
+  from: [11, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95],
+  to:   [ 1,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16]
+};
+var nlcdRef = ee.ImageCollection('projects/sat-io/open-datasets/USGS/ANNUAL_NLCD/LANDCOVER')
+  .filter(ee.Filter.or(ee.Filter.eq('year', NLCD_REFERENCE_YEAR),
+                       ee.Filter.calendarRange(NLCD_REFERENCE_YEAR, NLCD_REFERENCE_YEAR, 'year')))
+  .first();
+Map.addLayer(ee.Image(nlcdRef).remap(NLCD_TO_16.from, NLCD_TO_16.to),
+  {min: 1, max: CLASS_COUNT, palette: classPalette},
+  'USGS Annual NLCD ' + NLCD_REFERENCE_YEAR + ' (reference)', false);
+
+var hgacFC = countiesFC(Object.keys(COUNTY_FIPS).map(function (n) { return COUNTY_FIPS[n]; }));
+Map.addLayer(hgacFC.style({color: '000000', fillColor: '00000000', width: 2}), {}, 'H-GAC counties', false);
+
+
+// ==================================================================================
+// 11. USER INTERFACE
+// ==================================================================================
+var UI2 = {width: '260px', border: '1px solid #999999', text: '#444444', bg: 'white', labelSize: '10px', btnSize: '11px'};
+
+function uiLabel(text, size, bold, margin) {
+  return ui.Label({value: text, style: {fontSize: size || UI2.labelSize, fontWeight: bold ? 'bold' : 'normal',
+                                        color: UI2.text, margin: margin || '0px', whiteSpace: 'pre'}});
+}
+function uiCheck(label, value, onChange) {
+  return ui.Checkbox({label: label, value: value, onChange: onChange,
+                      style: {fontSize: UI2.labelSize, margin: '0px 0px 2px 0px', color: 'black'}});
+}
+function uiText(placeholder, value, onChange, width) {
+  return ui.Textbox({placeholder: placeholder, value: value, onChange: onChange,
+                     style: {width: width || '240px', fontSize: UI2.labelSize, margin: '0px 0px 6px 0px'}});
+}
+function uiSelect(items, value, onChange, width) {
+  return ui.Select({items: items, value: value, onChange: onChange,
+                    style: {width: width || '120px', fontSize: UI2.labelSize, margin: '0px 6px 6px 0px'}});
+}
+function uiSlider(min, max, value, step, onChange) {
+  return ui.Slider({min: min, max: max, value: value, step: step, onChange: onChange,
+                    style: {width: '240px', margin: '0px 0px 10px 0px'}});
+}
+function setShown(widgets, shown) { widgets.forEach(function (w) { w.style().set('shown', shown); }); }
+
+function collapsible(title, innerPanel, startShown) {
+  var shown = !!startShown;
+  innerPanel.style().set('shown', shown);
+  var head = ui.Button({
+    label: (shown ? '▼ ' : '▶ ') + title,
+    onClick: function () {
+      shown = !shown;
+      innerPanel.style().set('shown', shown);
+      head.setLabel((shown ? '▼ ' : '▶ ') + title);
+    },
+    style: {fontWeight: 'bold', fontSize: UI2.btnSize, margin: '6px 0px 2px 0px', textAlign: 'left',
+            stretch: 'horizontal', width: '240px'}
+  });
+  return ui.Panel({widgets: [head, innerPanel], layout: ui.Panel.Layout.flow('vertical'), style: {margin: '0px 0px 4px 0px'}});
+}
+
+// --- Project ---------------------------------------------------------------------------------
+var projectPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+projectPanel.add(uiLabel('Project name (used in export names):', UI2.labelSize, true, '0px 0px 2px 0px'));
+projectPanel.add(uiText('Project name', project_name, function (v) { project_name = v; }));
+
+var yearItems = [];
+for (var y = 2018; y <= 2030; y++) yearItems.push(String(y));
+var yearSelect   = uiSelect(yearItems, String(targetYear), function (v) { targetYear = parseInt(v, 10); });
+var seasonSelect = uiSelect(['All', 'Spring', 'Summer', 'Fall', 'Spring_Summer'], MOSAIC_MODE_PRIMARY,
+                            function (v) { MOSAIC_MODE_PRIMARY = v; });
+projectPanel.add(uiLabel('Year / season composite:', UI2.labelSize, true, '0px 0px 2px 0px'));
+projectPanel.add(ui.Panel({widgets: [yearSelect, seasonSelect], layout: ui.Panel.Layout.flow('horizontal')}));
+projectPanel.add(uiLabel('Cloud mask (CSPLUS = Cloud Score+, QA60 = legacy):', UI2.labelSize, true, '0px 0px 2px 0px'));
+projectPanel.add(uiSelect(['CSPLUS', 'QA60'], CLOUD_MASK, function (v) { CLOUD_MASK = v; }));
+
+// --- Counties --------------------------------------------------------------------------------
+function countyColumn(names, target, header) {
+  var widgets = [header ? uiLabel(header, UI2.btnSize, true, '0px 0px 4px 0px') : uiLabel(' ')];
+  names.forEach(function (name) {
+    widgets.push(uiCheck(name, false, function (checked) {
+      var fips = COUNTY_FIPS[name], idx = target.indexOf(fips);
+      if (checked && idx === -1) target.push(fips);
+      if (!checked && idx !== -1) target.splice(idx, 1);
+    }));
+  });
+  return ui.Panel({widgets: widgets, style: {padding: '4px', width: '120px', margin: '0px'}});
+}
+var countyNames = Object.keys(COUNTY_FIPS);
+var countyLeft = countyNames.slice(0, 7), countyRight = countyNames.slice(7);
+var countyPanel = ui.Panel({style: {padding: '0px', margin: '0px 0px 8px 0px'}});
+countyPanel.add(ui.Panel({widgets: [countyColumn(countyLeft, TRAIN_SELECTED_COUNTIES, 'TRAIN counties'),
+                                    countyColumn(countyRight, TRAIN_SELECTED_COUNTIES, null)],
+                          layout: ui.Panel.Layout.flow('horizontal')}));
+countyPanel.add(ui.Panel({widgets: [countyColumn(countyLeft, INFER_SELECTED_COUNTIES, 'INFER counties'),
+                                    countyColumn(countyRight, INFER_SELECTED_COUNTIES, null)],
+                          layout: ui.Panel.Layout.flow('horizontal')}));
+
+// --- Bands -----------------------------------------------------------------------------------
+var bandChecks = {};
+var bandsPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+bandsPanel.add(uiLabel('Model features (default set pre-checked):', UI2.btnSize, true, '0px 0px 4px 0px'));
+ALL_BAND_KEYS.forEach(function (key) {
+  var cb = uiCheck(key + '  -  ' + BAND_INFO[key], DEFAULT_MODEL_BANDS.indexOf(key) !== -1);
+  bandChecks[key] = cb;
+  bandsPanel.add(cb);
+});
+bandsPanel.add(uiCheck('Add per-season NDVI + MNDWI (multi-season modes)', ADD_SEASONAL_BANDS,
+                       function (v) { ADD_SEASONAL_BANDS = v; }));
+
+// --- Samples ---------------------------------------------------------------------------------
+var samplesPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+var sampleAssetBox = uiText('Asset id (FeatureCollection)', SAMPLE_ASSET_ID, function (v) { SAMPLE_ASSET_ID = v.trim(); });
+sampleAssetBox.style().set('shown', false);
+samplesPanel.add(uiLabel('Sample source:', UI2.btnSize, true, '0px 0px 2px 0px'));
+samplesPanel.add(uiSelect(['Drawn imports', 'Geometry asset', 'Pixel asset'], SAMPLE_SOURCE, function (v) {
+  SAMPLE_SOURCE = v;
+  sampleAssetBox.style().set('shown', v !== 'Drawn imports');
+}, '240px'));
+samplesPanel.add(sampleAssetBox);
+samplesPanel.add(uiCheck('Export sample geometries to asset', EXPORT_SAMPLE_GEOMS, function (v) { EXPORT_SAMPLE_GEOMS = v; }));
+samplesPanel.add(uiCheck('Export sampled pixels to asset (fast re-runs)', EXPORT_SAMPLED_PIXELS, function (v) { EXPORT_SAMPLED_PIXELS = v; }));
+samplesPanel.add(uiLabel('Max training pixels per class (blank = all):', UI2.labelSize, false, '4px 0px 2px 0px'));
+samplesPanel.add(uiText('e.g. 3000', MAX_TRAIN_PIXELS_PER_CLASS ? String(MAX_TRAIN_PIXELS_PER_CLASS) : '', function (v) {
+  var n = parseInt(v, 10);
+  MAX_TRAIN_PIXELS_PER_CLASS = (n > 0) ? n : null;
+}));
+
+// --- Options ---------------------------------------------------------------------------------
+var optionsPanel = ui.Panel({style: {padding: '0px', margin: '0px'}});
+
+var exportStackCheck = uiCheck('Export the stack (model bands) to Drive', EXPORT_ALL_IMAGES, function (v) { EXPORT_ALL_IMAGES = v; });
+exportStackCheck.style().set('shown', false);
+optionsPanel.add(uiCheck('Show mosaic only (skip Random Forest)', SHOW_MOSAICS_ONLY, function (v) {
+  SHOW_MOSAICS_ONLY = v;
+  exportStackCheck.style().set('shown', v);
+  updateRunLabel();
+}));
+optionsPanel.add(exportStackCheck);
+
+optionsPanel.add(uiCheck('Tune mode (grid search, then final run with best parameters)', TUNE_MODEL, function (v) {
+  TUNE_MODEL = v;
+  updateRunLabel();
+}));
+
+var destSelect = uiSelect(['Drive', 'Asset'], EXPORT_DESTINATION, function (v) { EXPORT_DESTINATION = v; }, '100px');
+destSelect.style().set('shown', false);
+optionsPanel.add(uiCheck('Export classified image', EXPORT_CLASSIFIED, function (v) {
+  EXPORT_CLASSIFIED = v;
+  destSelect.style().set('shown', v);
+}));
+optionsPanel.add(destSelect);
+
+var metaCheck = uiCheck('Export model metadata CSV (bands, parameters, settings)', EXPORT_MODEL_METADATA,
+                        function (v) { EXPORT_MODEL_METADATA = v; });
+metaCheck.style().set('shown', false);
+optionsPanel.add(uiCheck('Export trained RF model as asset', EXPORT_FINAL_MODEL, function (v) {
+  EXPORT_FINAL_MODEL = v;
+  metaCheck.style().set('shown', v);
+  if (!v) { EXPORT_MODEL_METADATA = false; metaCheck.setValue(false, false); }
+}));
+optionsPanel.add(metaCheck);
+
+optionsPanel.add(uiLabel('Apply a saved model instead of training (asset id):', UI2.labelSize, true, '4px 0px 2px 0px'));
+optionsPanel.add(uiText('blank = train a new forest', APPLY_MODEL_ASSET, function (v) { APPLY_MODEL_ASSET = v.trim(); }));
+
+optionsPanel.add(uiCheck('Smooth final raster (focal mode ' + (2 * SMOOTHING_RADIUS_PIX + 1) + 'x' +
+                         (2 * SMOOTHING_RADIUS_PIX + 1) + ')', APPLY_SMOOTHING, function (v) { APPLY_SMOOTHING = v; }));
+optionsPanel.add(uiCheck('Render classified layer at true 10 m (slow when zoomed out)', DISPLAY_AT_10M,
+                         function (v) { DISPLAY_AT_10M = v; }));
+
+var treesLabel = uiLabel('Number of trees:', UI2.labelSize, true);
+var treesSlider = uiSlider(50, 500, numberOfTrees, 50, function (v) { numberOfTrees = v; });
+var leafLabel = uiLabel('Min leaf population:', UI2.labelSize, true);
+var leafSlider = uiSlider(1, 5, minLeafPopulation, 1, function (v) { minLeafPopulation = v; });
+var bagLabel = uiLabel('Bag fraction:', UI2.labelSize, true);
+var bagSlider = uiSlider(0.1, 1.0, bagFraction, 0.01, function (v) { bagFraction = v; });
+var varsLabel = uiLabel('Variables per split:', UI2.labelSize, true);
+var varsSlider = uiSlider(2, 20, variablesPerSplit, 1, function (v) { variablesPerSplit = v; });
+var rfWidgets = [treesLabel, treesSlider, leafLabel, leafSlider, bagLabel, bagSlider, varsLabel, varsSlider];
+optionsPanel.add(uiCheck('Edit Random Forest parameters', false, function (v) { setShown(rfWidgets, v); }));
+rfWidgets.forEach(function (w) { optionsPanel.add(w); });
+setShown(rfWidgets, false);
+
+// Reset drawing layers (two-step confirmation)
+function resetDrawingLayers() {
+  var tools = Map.drawingTools();
+  tools.setShown(true);
+  while (tools.layers().length() > 0) tools.layers().remove(tools.layers().get(0));
+}
+var confirmButton = ui.Button({
+  label: 'ARE YOU SURE? All drawing layers will be removed. Refresh the page to cancel.',
+  onClick: function () { resetDrawingLayers(); confirmButton.style().set('shown', false); },
+  style: {position: 'top-center', color: 'red', fontWeight: 'bold', padding: '10px'}
+});
+Map.add(confirmButton);
+confirmButton.style().set('shown', false);
+
+var resetButton = ui.Button({
+  label: 'WARNING: remove all drawing layers',
+  onClick: function () { confirmButton.style().set('shown', true); },
+  style: {width: '240px', color: 'red', borderColor: 'red', borderWidth: '1px', borderStyle: 'dotted',
+          margin: '0px 0px 2px 0px', fontSize: UI2.labelSize}
+});
+resetButton.style().set('shown', false);
+optionsPanel.add(uiCheck('Enable reset mode', false, function (v) { resetButton.style().set('shown', v); }));
+
+// --- Results + run ---------------------------------------------------------------------------
+var overallResultLabel = ui.Label({value: 'Overall accuracy: -',
+  style: {fontWeight: 'bold', fontSize: UI2.btnSize, color: 'lightgray', margin: '6px 0px 0px 0px'}});
+var kappaResultLabel = ui.Label({value: 'Kappa: -',
+  style: {fontWeight: 'bold', fontSize: UI2.btnSize, color: 'lightgray', margin: '0px 0px 6px 0px'}});
+
+var runButton = ui.Button({
+  label: 'RUN: Random Forest MODEL',
+  onClick: function () {
+    if (TRAIN_SELECTED_COUNTIES.length === 0) { print('Select at least one TRAIN county.'); return; }
+    if (INFER_SELECTED_COUNTIES.length === 0) { print('Select at least one INFER county.'); return; }
+    if (SAMPLE_SOURCE !== 'Drawn imports' && !SAMPLE_ASSET_ID) {
+      print('Enter the sample asset id for source "' + SAMPLE_SOURCE + '".'); return;
+    }
+    run_ml_model();
+  },
+  style: {width: '240px', color: 'black', borderColor: 'darkgray', borderWidth: '3px', borderStyle: 'ridge',
+          margin: '6px 0px 6px 0px', fontSize: UI2.btnSize}
+});
+function updateRunLabel() {
+  runButton.setLabel(SHOW_MOSAICS_ONLY ? 'RUN: Show mosaic only'
+                   : TUNE_MODEL ? 'RUN: Tune + Random Forest MODEL' : 'RUN: Random Forest MODEL');
+}
+
+// --- Assemble --------------------------------------------------------------------------------
+var controlPanel = ui.Panel({style: {padding: '6px', border: UI2.border, width: UI2.width, maxHeight: '70%', backgroundColor: UI2.bg}});
+controlPanel.add(uiLabel('Machine Learning Control Parameters', '14px', true, '0px 0px 4px 0px'));
+controlPanel.add(uiLabel(
+  'Draw or import samples, pick TRAIN and INFER counties, then run.\n' +
+  'Save the script regularly to keep your samples.\n' +
+  'v4.0 - rework of v3.5 (D. Joshi & J. Campos, Nov 2025)', '9px', false, '0px 0px 8px 0px'));
+controlPanel.add(collapsible('Project',  projectPanel, false));
+controlPanel.add(collapsible('Counties', countyPanel,  true));
+controlPanel.add(collapsible('Bands',    bandsPanel,   false));
+controlPanel.add(collapsible('Samples',  samplesPanel, false));
+controlPanel.add(collapsible('Options',  optionsPanel, false));
+controlPanel.add(overallResultLabel);
+controlPanel.add(kappaResultLabel);
+controlPanel.add(runButton);
+controlPanel.add(resetButton);
+
+var panelShown = true;
+var toggleBtn = ui.Button({
+  label: '▼ Control Panel',
+  onClick: function () {
+    panelShown = !panelShown;
+    controlPanel.style().set('shown', panelShown);
+    toggleBtn.setLabel((panelShown ? '▼' : '▶') + ' Control Panel');
+  },
+  style: {width: UI2.width, fontWeight: 'bold', fontSize: UI2.btnSize, textAlign: 'left', margin: '0px',
+          border: UI2.border, backgroundColor: UI2.bg}
+});
+Map.add(ui.Panel({widgets: [toggleBtn, controlPanel],
+                  style: {position: 'bottom-right', padding: '0px', backgroundColor: 'rgba(255,255,255,0.0)'}}));
+
+// Legend (left)
+function makeLegend(palette, labels, title) {
+  var legend = ui.Panel({style: {padding: '8px 12px', backgroundColor: 'white'}});
+  legend.add(ui.Label({value: title, style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 6px 0'}}));
+  labels.forEach(function (name, i) {
+    legend.add(ui.Panel({
+      widgets: [ui.Label('', {backgroundColor: palette[i], padding: '8px', margin: '0 6px 0 0', border: '1px solid #000'}),
+                ui.Label(name, {fontSize: '12px', margin: '0'})],
+      layout: ui.Panel.Layout.flow('horizontal')
+    }));
+  });
+  return legend;
+}
+Map.add(ui.Panel({
+  widgets: [ui.Label(' Random Forest Application', {fontWeight: 'bold', fontSize: '24px'}),
+            makeLegend(classPalette, classLabels, 'Classified 16C Legend')],
+  style: {padding: '2px', border: UI2.border, width: '320px', position: 'bottom-left'}
+}));
